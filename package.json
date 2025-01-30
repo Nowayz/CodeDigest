@@ -4,19 +4,23 @@
     "codedigest": "./codedigest.mjs"
   },
   "version": "1.0.2",
-  "description": "<p align=\"center\">   <img src=\"https://raw.githubusercontent.com/Nowayz/CodeDigest/refs/heads/resources/codedigest_logo.png\" alt=\"logo\"/> </p> **CodeDigest** is a simple single-file Node.js command-line tool that consolidates an entire code repository (directory structure and text-based files) into a digest file for easy consumption by your preferred LLM (Large Language Model). It helps you quickly gather all source code in one place so you can feed it into LLM-based tools for analysis, code generation, or any other AI-driven development workflows.",
+  "description": "CodeDigest is a simple single-file Node.js command-line tool that consolidates an entire code repository (directory structure and text-based files) into a digest file for easy consumption by your preferred LLM (Large Language Model).",
   "main": "codedigest.mjs",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Nowayz/CodeDigest.git"
-  },
-  "author": "Phillip McNallen",
+  "repository": "github:Nowayz/CodeDigest",
+  "author": "Phillip McNallen <phil@3rdera.com> (https://github.com/Nowayz)",
   "license": "ISC",
   "bugs": {
     "url": "https://github.com/Nowayz/CodeDigest/issues"
   },
-  "homepage": "https://github.com/Nowayz/CodeDigest#readme"
+  "homepage": "https://github.com/Nowayz/CodeDigest#readme",
+  "keywords": [
+    "code",
+    "digest",
+    "LLM",
+    "Node.js",
+    "CLI"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  }
 }
