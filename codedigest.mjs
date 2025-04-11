@@ -2,13 +2,13 @@
 
 /**
  * codedigest.mjs - A Node.js script to generate a digest of a directory's structure and file contents,
- *                  or import a digest to recreate the structure.
+ *                  or import a digest to recreate the structure, automatically applying git diffs found within.
  */
 
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync,
   lstatSync, readdirSync, readlinkSync, openSync,
-  readSync, closeSync
+  readSync, closeSync, unlinkSync // Added unlinkSync for deleting files via diff
 } from 'node:fs';
 
 import {
@@ -16,6 +16,7 @@ import {
 } from 'node:path';
 
 import { createHash } from 'node:crypto';
+import { applyPatch } from 'diff'; // Import the patch application function
 
 ////////////////////////////////////////////////////////////////////////////////
 // Constants
@@ -28,8 +29,12 @@ const CHUNK_SIZE           = 1024 * 1024;       // 1 MB
 
 // Regular expressions for digest parsing
 const FILE_START_REGEX = /^### CODEDIGEST_FILE: (.+) ###$/;
-// CHECKSUM_REGEX is removed as checksums are no longer stored in the digest
-const FILE_END_REGEX = /^### CODEDIGEST_END ###$/;
+const FILE_END_REGEX   = /^### CODEDIGEST_END ###$/;
+const DIFF_START_REGEX = /^--- (?:a\/)?(.+)$/; // Matches git diff header start
+const DIFF_TARGET_REGEX = /^\+\+\+ (?:b\/)?(.+)$/; // Matches git diff header target
+const DIFF_NEW_FILE_REGEX = /^--- \/dev\/null$/;
+const DIFF_DELETE_FILE_REGEX = /^\+\+\+ \/dev\/null$/;
+
 
 /**
  * Default gitignore-style patterns to exclude.
@@ -71,6 +76,7 @@ const FORMAT = {
   red:    (text) => `\x1b[31m${text}\x1b[0m`,
   green:  (text) => `\x1b[32m${text}\x1b[0m`,
   yellow: (text) => `\x1b[33m${text}\x1b[0m`,
+  blue:   (text) => `\x1b[34m${text}\x1b[0m`, // Added blue for diffs
   white:  (text) => `\x1b[37m${text}\x1b[0m`,
   gray:   (text) => `\x1b[90m${text}\x1b[0m`,
   invert: (text) => `\x1b[7m${text}\x1b[27m`,
@@ -86,6 +92,16 @@ const FORMAT = {
  * @property {string} content - The content of the file.
  * @property {number} size - The size of the file in bytes.
  */
+
+/**
+ * @typedef {Object} DigestEntry
+ * @property {'file' | 'diff'} type - The type of entry.
+ * @property {string} path - The relative path the entry applies to.
+ * @property {string} content - The full file content (for type 'file') or the diff text (for type 'diff').
+ * @property {boolean} [isNewFileDiff] - Indicates if the diff creates a new file.
+ * @property {boolean} [isDeleteFileDiff] - Indicates if the diff deletes a file.
+ */
+
 
 /**
  * @typedef {Object} GitIgnoreRule
@@ -451,7 +467,7 @@ function isTextFile(filePath, fileSize = -1) {
     '.css',  '.scss', '.sass', '.less','.styl','.php', '.java', '.rb',   '.go',
     '.rs',   '.c',    '.h',    '.cpp', '.hpp', '.cs',  '.swift','.kt',   '.kts',
     '.scala','.pl',   '.pm',   '.r',   '.lua', '.sql', '.gitignore', '.gitattributes',
-    '.gitmodules', 'dockerfile', 'makefile', '.editorconfig', '.env'
+    '.gitmodules', 'dockerfile', 'makefile', '.editorconfig', '.env', '.diff', '.patch' // Added diff/patch
     // Add more known text extensions if needed
   ]);
 
@@ -883,6 +899,7 @@ function generateDirectoryTree(
 
   displayEntries.forEach((entry, index) => {
     // Check truncation conditions *before* processing the entry
+    const isLast = index === displayEntries.length - 1; // Need isLast for truncation message
     if (result.truncated || result.count > MAX_TREE_NODES) {
         if (!result.truncated) { // Add truncation message only once
             result.content += `${prefix}${isLast ? '└── ' : '├── '}[Tree truncated - too many entries]\n`;
@@ -891,7 +908,7 @@ function generateDirectoryTree(
         return; // Stop processing further entries at this level
     }
 
-    const isLast = index === displayEntries.length - 1;
+    // const isLast = index === displayEntries.length - 1; // Moved up
     const connector = isLast ? '└── ' : '├── ';
     const entryPath = join(resolvedDirPath, entry.name); // Use resolved path
     let displayName = entry.name;
@@ -1072,73 +1089,125 @@ ${
 ////////////////////////////////////////////////////////////////////////////////
 
 /**
- * Parse a digest file and extract file paths and content.
- * Assumes strict format where every file block ends with CODEDIGEST_END.
- * Checksum lines are ignored.
+ * Parse a digest file and extract file paths, content, and diffs.
+ * Recognizes both ### CODEDIGEST_FILE: ... ### blocks and git diff blocks.
  *
  * @param {string} digestContent - Content of the digest file
- * @returns {Array<{path: string, content: string}>} - Array of file info (path and content only)
+ * @returns {Array<DigestEntry>} - Array of parsed entries (files or diffs)
  */
 function parseDigestContent(digestContent) {
   const lines = digestContent.split(/\r?\n/);
-  /** @type {Array<{path: string, content: string}>} */
-  const files = [];
-
-  let currentFile = null;
+  /** @type {Array<DigestEntry>} */
+  const entries = [];
+  let currentEntry = null; // Holds the entry being built
   let currentContent = [];
-  // Removed currentChecksum and inHeader logic related to checksum
+  let state = 'seeking'; // 'seeking', 'in_file', 'in_diff'
 
-  for (const line of lines) {
-    const fileMatch = line.match(FILE_START_REGEX);
-    // Removed checksumMatch
-    const endMatch = line.match(FILE_END_REGEX);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
 
-    if (fileMatch) {
-      // New file section starts
-      if (currentFile !== null) {
-        // If we were in a file block but didn't see an END marker, it's malformed.
-        console.warn(FORMAT.yellow(`Warning: Malformed entry detected. File section for '${currentFile}' started but was interrupted by a new file section before an END marker.`));
+    // --- State Transitions ---
+    if (state === 'seeking') {
+      const fileMatch = line.match(FILE_START_REGEX);
+      const diffMatch = line.match(DIFF_START_REGEX);
+
+      if (fileMatch) {
+        state = 'in_file';
+        currentEntry = { type: 'file', path: fileMatch[1], content: '' };
+        currentContent = [];
+      } else if (diffMatch) {
+        // Found the start of a diff block '--- a/path'
+        const firstLine = line;
+        const path1 = diffMatch[1];
+        // Look ahead for '+++ b/path'
+        if (i + 1 < lines.length) {
+          const nextLine = lines[i+1];
+          const targetMatch = nextLine.match(DIFF_TARGET_REGEX);
+          if (targetMatch) {
+            const path2 = targetMatch[1];
+            // Basic check: paths should usually match (or one is /dev/null)
+            if (path1 === path2 || path1 === '/dev/null' || path2 === '/dev/null') {
+              state = 'in_diff';
+              // Use the target path unless it's /dev/null, then use source path
+              const entryPath = (path2 !== '/dev/null') ? path2 : path1;
+              currentEntry = {
+                  type: 'diff',
+                  path: entryPath.trim(), // Trim potential whitespace
+                  content: '',
+                  isNewFileDiff: firstLine.match(DIFF_NEW_FILE_REGEX) !== null,
+                  isDeleteFileDiff: nextLine.match(DIFF_DELETE_FILE_REGEX) !== null,
+              };
+              currentContent = [line, nextLine]; // Start content with header lines
+              i++; // Consume the '+++' line as well
+            } else {
+               console.warn(FORMAT.yellow(`Warning: Mismatched paths in diff header near line ${i+1}: '${path1}' vs '${path2}'. Skipping diff block.`));
+               // Remain in 'seeking' state
+            }
+          } else {
+             // Found '---' but not '+++' immediately after. Treat as regular content maybe? Or skip? Let's skip.
+             console.warn(FORMAT.yellow(`Warning: Found diff start '---' but not '+++' on next line near line ${i+1}. Skipping potential diff block.`));
+             // Remain in 'seeking' state
+          }
+        } else {
+           // Found '---' at the very end of the file. Invalid diff.
+           console.warn(FORMAT.yellow(`Warning: Found diff start '---' at end of file near line ${i+1}. Skipping potential diff block.`));
+           // Remain in 'seeking' state
+        }
       }
-      // Reset for new file
-      currentFile = fileMatch[1];
-      currentContent = [];
-      // Removed checksum reset
-    }
-    // Removed checksum parsing logic
-    else if (currentFile !== null && endMatch) {
-      // End of file section - push the file path and content.
-      files.push({
-        path: currentFile,
-        content: currentContent.join('\n'),
-        // checksum property removed
-      });
-      // Reset state
-      currentFile = null;
-      currentContent = [];
-      // Removed checksum reset
-    } else if (currentFile !== null) {
-      // Line belongs to the current file's content
-      // Check if it's the checksum line and ignore it if present (for backward compatibility)
-      if (!line.match(/^### CHECKSUM: [a-f0-9]+ ###$/)) {
-          currentContent.push(line);
+      // else: line is ignored if seeking and not a start marker
+    } else if (state === 'in_file') {
+      const endMatch = line.match(FILE_END_REGEX);
+      if (endMatch) {
+        // Finalize the file entry
+        currentEntry.content = currentContent.join('\n');
+        entries.push(currentEntry);
+        currentEntry = null;
+        currentContent = [];
+        state = 'seeking';
+      } else {
+        // Add line to current file content
+        currentContent.push(line);
+      }
+    } else if (state === 'in_diff') {
+      // A diff block ends when we hit the start of a new block OR end of file
+      const nextFileMatch = line.match(FILE_START_REGEX);
+      const nextDiffMatch = line.match(DIFF_START_REGEX);
+
+      if (nextFileMatch || nextDiffMatch) {
+        // Finalize the diff entry
+        currentEntry.content = currentContent.join('\n');
+        entries.push(currentEntry);
+        currentEntry = null;
+        currentContent = [];
+        state = 'seeking';
+        i--; // Re-process the current line as it's the start of the next block
+      } else {
+        // Add line to current diff content
+        currentContent.push(line);
       }
     }
-    // Ignore lines outside of file blocks or checksum lines
+  } // End loop through lines
+
+  // --- Finalize any open entry at EOF ---
+  if (currentEntry) {
+    if (state === 'in_file') {
+       console.warn(FORMAT.yellow(`Warning: Malformed digest. End of input reached while processing file section for '${currentEntry.path}' without an END marker.`));
+       // Decide whether to add potentially incomplete file. Let's add it but warn.
+       currentEntry.content = currentContent.join('\n');
+       entries.push(currentEntry);
+    } else if (state === 'in_diff') {
+       // Diff block naturally ends at EOF
+       currentEntry.content = currentContent.join('\n');
+       entries.push(currentEntry);
+    }
   }
 
-  // Check if the loop ended while inside a file block without an END marker
-  if (currentFile !== null) {
-      console.warn(FORMAT.yellow(`Warning: Malformed digest. End of input reached while processing file section for '${currentFile}' without an END marker.`));
-      // Do NOT add this potentially incomplete file based on the strict format requirement.
-  }
-
-  return files;
+  return entries;
 }
 
 
 /**
- * Import files from a digest and create/update files in the target directory.
- * Compares checksum of digest content against checksum of existing file content.
+ * Import files and apply diffs from a digest into the target directory.
  *
  * @param {string} digestFilePath - Path to the digest file
  * @param {string} targetDir - Directory where files should be created/updated
@@ -1151,9 +1220,11 @@ function importDigest(digestFilePath, targetDir, dryRun, quiet) {
     created: [],
     updated: [],
     unchanged: [],
+    deleted: [], // Added for diff deletions
+    diffApplied: [], // Added for successful diff applications
+    diffFailed: [], // Added for failed diff applications
     skippedOutsideTarget: [],
     errors: []
-    // checksumMismatch category removed
   };
 
   if (!existsSync(digestFilePath)) {
@@ -1174,135 +1245,266 @@ function importDigest(digestFilePath, targetDir, dryRun, quiet) {
   }
 
   const digestContent = readFileSync(digestFilePath, 'utf-8');
-  const files = parseDigestContent(digestContent); // Parses path and content only
+  const entries = parseDigestContent(digestContent); // Parses into DigestEntry objects
 
-  if (!quiet) console.log(`Parsed ${files.length} file entries from digest`);
+  if (!quiet) console.log(`Parsed ${entries.length} file/diff entries from digest`);
 
-  for (const file of files) {
+  for (const entry of entries) {
     try {
       // --- Path Traversal Prevention ---
-      const initialTargetPath = join(resolvedBaseTargetDir, file.path);
+      const initialTargetPath = join(resolvedBaseTargetDir, entry.path);
       const resolvedTargetPath = resolve(initialTargetPath);
       if (!(resolvedTargetPath.startsWith(resolvedBaseTargetDir + sep) || resolvedTargetPath === resolvedBaseTargetDir)) {
-          summary.skippedOutsideTarget.push(file.path);
-          if (!quiet) console.error(FORMAT.red(`Security Risk: Skipping ${file.path} - path resolves outside target directory '${resolvedBaseTargetDir}'`));
-          continue; // Skip this file
+          summary.skippedOutsideTarget.push(entry.path);
+          if (!quiet) console.error(FORMAT.red(`Security Risk: Skipping ${entry.path} - path resolves outside target directory '${resolvedBaseTargetDir}'`));
+          continue; // Skip this entry
       }
       // --- End Path Traversal Prevention ---
 
       const targetFileDir = dirname(resolvedTargetPath);
       const fileExists = existsSync(resolvedTargetPath);
 
-      // Calculate checksum of the content *from the digest*
-      const digestContentChecksum = calculateChecksum(file.content);
+      // --- Handle based on entry type ---
+      if (entry.type === 'file') {
+          // --- Standard File Entry Processing ---
+          const digestContentChecksum = calculateChecksum(entry.content);
+          let action = 'unknown';
+          let existingFileChecksum = null;
 
-      let action = 'unknown'; // 'create', 'update', 'unchanged', 'error'
-      let existingFileChecksum = null;
-
-      if (fileExists) {
-          try {
-              const existingContent = readFileSync(resolvedTargetPath, 'utf-8');
-              existingFileChecksum = calculateChecksum(existingContent);
-
-              if (digestContentChecksum === existingFileChecksum) {
-                  action = 'unchanged';
-                  summary.unchanged.push(file.path);
-              } else {
-                  action = 'update';
-                  summary.updated.push(file.path);
-              }
-          } catch (readError) {
-              action = 'error';
-              summary.errors.push({ path: file.path, error: `Could not read existing file for comparison: ${readError.message}` });
-              if (!quiet) console.error(FORMAT.red(`Error reading existing file ${file.path} for comparison: ${readError.message}`));
-          }
-      } else {
-          action = 'create';
-          summary.created.push(file.path);
-      }
-
-      // Perform actions based on comparison and dryRun status
-      if (action === 'error') {
-          continue; // Skip if reading existing file failed
-      }
-
-      if (dryRun) {
-          // Log intended actions
-          if (action === 'create') {
-              if (!existsSync(targetFileDir)) {
-                 if (!quiet) console.log(`Would create directory: ${relative(process.cwd(), targetFileDir) || '.'}`);
-              }
-              if (!quiet) console.log(`Would create: ${file.path}`);
-          } else if (action === 'update') {
-              if (!quiet) console.log(`Would update: ${file.path} (Checksum differs: Digest ${digestContentChecksum} vs Disk ${existingFileChecksum})`);
-          } else if (action === 'unchanged') {
-              // Optionally log unchanged files if verbose enough
-              // if (!quiet) console.log(FORMAT.gray(`Would leave unchanged: ${file.path} (Checksum matches: ${digestContentChecksum})`));
-          }
-      } else { // Actual import
-          if (action === 'create' || action === 'update') {
-              // Ensure directory exists before writing
-              if (!existsSync(targetFileDir)) {
-                 try {
-                    mkdirSync(targetFileDir, { recursive: true });
-                 } catch (mkdirError) {
-                     summary.errors.push({ path: file.path, error: `Failed to create directory ${targetFileDir}: ${mkdirError.message}` });
-                     if (!quiet) console.error(FORMAT.red(`Error creating directory for ${file.path}: ${mkdirError.message}`));
-                     continue; // Skip this file if directory can't be made
-                 }
-              }
-              // Write the file content from the digest
+          if (fileExists) {
               try {
-                  writeFileSync(resolvedTargetPath, file.content);
-                  if (!quiet) {
-                      if (action === 'create') {
-                          console.log(FORMAT.green(`Created: ${file.path}`));
-                      } else { // action === 'update'
-                          console.log(FORMAT.yellow(`Updated: ${file.path}`));
+                  const existingContent = readFileSync(resolvedTargetPath, 'utf-8');
+                  existingFileChecksum = calculateChecksum(existingContent);
+
+                  if (digestContentChecksum === existingFileChecksum) {
+                      action = 'unchanged';
+                      summary.unchanged.push(entry.path);
+                  } else {
+                      action = 'update';
+                      summary.updated.push(entry.path);
+                  }
+              } catch (readError) {
+                  action = 'error';
+                  summary.errors.push({ path: entry.path, error: `Could not read existing file for comparison: ${readError.message}` });
+                  if (!quiet) console.error(FORMAT.red(`Error reading existing file ${entry.path} for comparison: ${readError.message}`));
+              }
+          } else {
+              action = 'create';
+              summary.created.push(entry.path);
+          }
+
+          if (action === 'error') continue;
+
+          if (dryRun) {
+              if (action === 'create') {
+                  if (!existsSync(targetFileDir)) {
+                     if (!quiet) console.log(`Would create directory: ${relative(process.cwd(), targetFileDir) || '.'}`);
+                  }
+                  if (!quiet) console.log(`Would create: ${entry.path}`);
+              } else if (action === 'update') {
+                  if (!quiet) console.log(`Would update: ${entry.path} (Checksum differs)`);
+              }
+          } else { // Actual import
+              if (action === 'create' || action === 'update') {
+                  if (!existsSync(targetFileDir)) {
+                     try { mkdirSync(targetFileDir, { recursive: true }); } catch (mkdirError) {
+                         summary.errors.push({ path: entry.path, error: `Failed to create directory ${targetFileDir}: ${mkdirError.message}` });
+                         if (!quiet) console.error(FORMAT.red(`Error creating directory for ${entry.path}: ${mkdirError.message}`));
+                         continue;
+                     }
+                  }
+                  try {
+                      writeFileSync(resolvedTargetPath, entry.content);
+                      if (!quiet) {
+                          if (action === 'create') console.log(FORMAT.green(`Created: ${entry.path}`));
+                          else console.log(FORMAT.yellow(`Updated: ${entry.path}`));
+                      }
+                  } catch (writeError) {
+                      summary.errors.push({ path: entry.path, error: `Failed to write file: ${writeError.message}` });
+                      if (!quiet) console.error(FORMAT.red(`Error writing file ${entry.path}: ${writeError.message}`));
+                  }
+              }
+          }
+          // --- End Standard File Entry Processing ---
+
+      } else if (entry.type === 'diff') {
+          // --- Diff Entry Processing ---
+          let diffAction = 'unknown'; // 'apply', 'delete', 'create', 'fail', 'skip'
+
+          if (entry.isDeleteFileDiff) {
+              // --- Handle File Deletion Diff ---
+              if (fileExists) {
+                  diffAction = 'delete';
+                  summary.deleted.push(entry.path);
+                  if (dryRun) {
+                      if (!quiet) console.log(`Would delete: ${entry.path} (via diff)`);
+                  } else {
+                      try {
+                          unlinkSync(resolvedTargetPath);
+                          if (!quiet) console.log(FORMAT.red(`Deleted: ${entry.path} (via diff)`));
+                      } catch (deleteError) {
+                          diffAction = 'fail';
+                          summary.errors.push({ path: entry.path, error: `Failed to delete file via diff: ${deleteError.message}` });
+                          if (!quiet) console.error(FORMAT.red(`Error deleting file ${entry.path} via diff: ${deleteError.message}`));
                       }
                   }
-              } catch (writeError) {
-                  summary.errors.push({ path: file.path, error: `Failed to write file: ${writeError.message}` });
-                  if (!quiet) console.error(FORMAT.red(`Error writing file ${file.path}: ${writeError.message}`));
+              } else {
+                  // Deleting a non-existent file is technically a no-op success
+                  diffAction = 'skip';
+                  if (!quiet) console.log(FORMAT.gray(`Skipped delete diff (file not found): ${entry.path}`));
               }
-          } else if (action === 'unchanged') {
-              // Log unchanged only if verbose?
-              // if (!quiet) console.log(FORMAT.gray(`Unchanged: ${file.path}`));
+              // --- End File Deletion Diff ---
+
+          } else if (entry.isNewFileDiff) {
+              // --- Handle New File Diff ---
+              if (fileExists) {
+                  diffAction = 'fail';
+                  summary.diffFailed.push({ path: entry.path, reason: 'File already exists for new-file diff' });
+                  if (!quiet) console.warn(FORMAT.yellow(`Skipped new-file diff (file already exists): ${entry.path}`));
+              } else {
+                  try {
+                      const patchedContent = applyPatch('', entry.content); // Apply patch to empty string
+                      if (patchedContent === false) {
+                          diffAction = 'fail';
+                          summary.diffFailed.push({ path: entry.path, reason: 'Patch application failed for new file' });
+                          if (!quiet) console.error(FORMAT.red(`Failed to apply new-file diff: ${entry.path}`));
+                      } else {
+                          diffAction = 'create';
+                          summary.created.push(entry.path + ' (via diff)'); // Mark as created via diff
+                          summary.diffApplied.push(entry.path);
+                          if (dryRun) {
+                              if (!existsSync(targetFileDir)) {
+                                 if (!quiet) console.log(`Would create directory: ${relative(process.cwd(), targetFileDir) || '.'}`);
+                              }
+                              if (!quiet) console.log(`Would create via diff: ${entry.path}`);
+                          } else {
+                              if (!existsSync(targetFileDir)) {
+                                 try { mkdirSync(targetFileDir, { recursive: true }); } catch (mkdirError) {
+                                     summary.errors.push({ path: entry.path, error: `Failed to create directory for diff-created file ${targetFileDir}: ${mkdirError.message}` });
+                                     if (!quiet) console.error(FORMAT.red(`Error creating directory for ${entry.path} (via diff): ${mkdirError.message}`));
+                                     continue; // Skip if dir fails
+                                 }
+                              }
+                              try {
+                                  writeFileSync(resolvedTargetPath, patchedContent);
+                                  if (!quiet) console.log(FORMAT.green(`Created via diff: ${entry.path}`));
+                              } catch (writeError) {
+                                  summary.errors.push({ path: entry.path, error: `Failed to write diff-created file: ${writeError.message}` });
+                                  if (!quiet) console.error(FORMAT.red(`Error writing file ${entry.path} (via diff): ${writeError.message}`));
+                              }
+                          }
+                      }
+                  } catch (patchError) {
+                      diffAction = 'fail';
+                      summary.diffFailed.push({ path: entry.path, reason: `Patch library error for new file: ${patchError.message}` });
+                      if (!quiet) console.error(FORMAT.red(`Error applying new-file diff for ${entry.path}: ${patchError.message}`));
+                  }
+              }
+              // --- End New File Diff ---
+
+          } else {
+              // --- Handle Standard Modification Diff ---
+              if (!fileExists) {
+                  diffAction = 'fail';
+                  summary.diffFailed.push({ path: entry.path, reason: 'Target file not found for modification diff' });
+                  if (!quiet) console.warn(FORMAT.yellow(`Skipped modification diff (file not found): ${entry.path}`));
+              } else {
+                  try {
+                      const existingContent = readFileSync(resolvedTargetPath, 'utf-8');
+                      const patchedContent = applyPatch(existingContent, entry.content);
+
+                      if (patchedContent === false) {
+                          diffAction = 'fail';
+                          summary.diffFailed.push({ path: entry.path, reason: 'Patch application failed (hunk mismatch?)' });
+                          if (!quiet) console.error(FORMAT.red(`Failed to apply diff (hunk mismatch?): ${entry.path}`));
+                      } else {
+                          // Check if content actually changed
+                          const originalChecksum = calculateChecksum(existingContent);
+                          const patchedChecksum = calculateChecksum(patchedContent);
+
+                          if (originalChecksum === patchedChecksum) {
+                              diffAction = 'skip'; // Applied cleanly, but no change
+                              summary.unchanged.push(entry.path + ' (diff applied)');
+                              // No console log needed unless verbose
+                          } else {
+                              diffAction = 'apply';
+                              summary.diffApplied.push(entry.path);
+                              summary.updated.push(entry.path + ' (via diff)'); // Mark as updated via diff
+
+                              if (dryRun) {
+                                  if (!quiet) console.log(`Would apply diff to: ${entry.path}`);
+                              } else {
+                                  try {
+                                      writeFileSync(resolvedTargetPath, patchedContent);
+                                      if (!quiet) console.log(FORMAT.blue(`Applied diff to: ${entry.path}`)); // Use blue for applied diffs
+                                  } catch (writeError) {
+                                      summary.errors.push({ path: entry.path, error: `Failed to write patched file: ${writeError.message}` });
+                                      if (!quiet) console.error(FORMAT.red(`Error writing patched file ${entry.path}: ${writeError.message}`));
+                                  }
+                              }
+                          }
+                      }
+                  } catch (patchErrorOrReadError) {
+                      diffAction = 'fail';
+                      summary.diffFailed.push({ path: entry.path, reason: `Error reading file or applying patch: ${patchErrorOrReadError.message}` });
+                      if (!quiet) console.error(FORMAT.red(`Error processing diff for ${entry.path}: ${patchErrorOrReadError.message}`));
+                  }
+              }
+              // --- End Standard Modification Diff ---
           }
-      }
+      } // --- End Diff Entry Processing ---
+
     } catch (error) {
-      // Catch unexpected errors during the processing of a single file entry
-      summary.errors.push({ path: file.path || 'Unknown path', error: error.message });
-      if (!quiet) console.error(FORMAT.red(`Error processing entry for ${file.path || 'Unknown path'}: ${error.message}`));
+      // Catch unexpected errors during the processing of a single entry
+      summary.errors.push({ path: entry.path || 'Unknown path', error: error.message });
+      if (!quiet) console.error(FORMAT.red(`Error processing entry for ${entry.path || 'Unknown path'}: ${error.message}`));
     }
-  } // End loop through files
+  } // End loop through entries
 
   return summary;
 }
 
 /**
- * Print a summary of the import operation.
+ * Print a summary of the import operation, including diff details.
  */
 function printImportSummary(summary, dryRun) {
-  const { bold, green, yellow, red, gray, invert } = FORMAT;
+  const { bold, green, yellow, red, gray, blue, invert } = FORMAT; // Added blue
   const actionVerb = dryRun ? 'Would be' : 'Were';
   const actionVerbPast = dryRun ? 'Would have been' : 'Were';
 
+  // Separate counts for files created/updated directly vs via diff
+  const createdDirectly = summary.created.filter(p => !p.includes('(via diff)')).length;
+  const createdViaDiff = summary.created.filter(p => p.includes('(via diff)')).length;
+  const updatedDirectly = summary.updated.filter(p => !p.includes('(via diff)')).length;
+  const updatedViaDiff = summary.updated.filter(p => p.includes('(via diff)')).length;
+  const unchangedDirectly = summary.unchanged.filter(p => !p.includes('(diff applied)')).length;
+  const unchangedViaDiff = summary.unchanged.filter(p => p.includes('(diff applied)')).length;
+
+
   console.log(`
 ${invert(bold(` Import Summary ${dryRun ? '(Dry Run)' : ''} `))}
-${green(`Files ${actionVerb} created:`)}      ${summary.created.length}
-${yellow(`Files ${actionVerb} updated (checksum mismatch):`)} ${summary.updated.length}
-${gray(`Files ${actionVerb} unchanged (checksum match):`)}    ${summary.unchanged.length}
-${red(`Path outside target (skipped):`)} ${summary.skippedOutsideTarget.length}
-${red(`Other errors during processing:`)} ${summary.errors.length}
+${green(`Files ${actionVerb} created (directly):`)}      ${createdDirectly}
+${green(`Files ${actionVerb} created (via diff):`)}      ${createdViaDiff}
+${yellow(`Files ${actionVerb} updated (directly):`)}     ${updatedDirectly}
+${blue(`Files ${actionVerb} updated (via diff):`)}      ${updatedViaDiff} ${summary.diffApplied.length > 0 ? `(${summary.diffApplied.length} diffs applied)` : ''}
+${red(`Files ${actionVerb} deleted (via diff):`)}      ${summary.deleted.length}
+${gray(`Files ${actionVerb} unchanged (no diff):`)}    ${unchangedDirectly}
+${gray(`Files ${actionVerb} unchanged (diff applied):`)} ${unchangedViaDiff}
+${red(`Diff application failed:`)}           ${summary.diffFailed.length}
+${red(`Path outside target (skipped):`)}     ${summary.skippedOutsideTarget.length}
+${red(`Other errors during processing:`)}    ${summary.errors.length}
 `); // Add trailing newline for spacing
 
   // Optionally list files, maybe limit list length?
   const MAX_LIST = 15;
-  const printList = (label, list, color) => {
+  const printList = (label, list, color, detailKey = null) => {
       if (list.length > 0) {
           console.log(`${bold(label)}`);
-          list.slice(0, MAX_LIST).forEach(f => console.log(`  ${color(f)}`));
+          list.slice(0, MAX_LIST).forEach(item => {
+              const path = detailKey ? item.path : item;
+              const detail = detailKey && item[detailKey] ? ` (${item[detailKey]})` : '';
+              console.log(`  ${color(path)}${gray(detail)}`);
+          });
           if (list.length > MAX_LIST) {
               console.log(`  ${gray(`...and ${list.length - MAX_LIST} more`)}`);
           }
@@ -1310,14 +1512,18 @@ ${red(`Other errors during processing:`)} ${summary.errors.length}
       }
   };
 
-  printList(`${actionVerbPast} Created:`, summary.created, green);
-  printList(`${actionVerbPast} Updated (Checksum Mismatch):`, summary.updated, yellow);
+  // Filter lists before printing
+  printList(`${actionVerbPast} Created (Directly):`, summary.created.filter(p => !p.includes('(via diff)')), green);
+  printList(`${actionVerbPast} Created (Via Diff):`, summary.created.filter(p => p.includes('(via diff)')).map(p => p.replace(' (via diff)', '')), green);
+  printList(`${actionVerbPast} Updated (Directly):`, summary.updated.filter(p => !p.includes('(via diff)')), yellow);
+  printList(`${actionVerbPast} Updated (Via Diff):`, summary.updated.filter(p => p.includes('(via diff)')).map(p => p.replace(' (via diff)', '')), blue);
+  printList(`${actionVerbPast} Deleted (Via Diff):`, summary.deleted, red);
   // Don't usually need to list unchanged files
-  // printList(`${actionVerbPast} Unchanged (Checksum Match):`, summary.unchanged, gray);
+  printList('Diff Application Failed:', summary.diffFailed, red, 'reason');
   printList('Paths Outside Target (Skipped):', summary.skippedOutsideTarget, red);
 
   if (summary.errors.length > 0) {
-      console.log(`${bold('Errors During Processing:')}`);
+      console.log(`${bold('Other Errors During Processing:')}`);
       summary.errors.slice(0, MAX_LIST).forEach(e => console.log(`  ${red(`${e.path}: ${e.error}`)}`));
       if (summary.errors.length > MAX_LIST) {
            console.log(`  ${gray(`...and ${summary.errors.length - MAX_LIST} more errors`)}`);
@@ -1339,7 +1545,8 @@ ${FORMAT.invert(' Modes ')}
 
   ${FORMAT.bold('Generate Mode (Default):')} Creates a digest file from a directory.
   ${FORMAT.bold('Import Mode:')} Creates/updates files in a directory based on a digest file.
-                 Uses checksum comparison between digest content and existing file content.
+                 Automatically detects and applies git diff formatted patches found
+                 within the digest file. Compares checksum for full file entries.
 
 ${FORMAT.invert(' Generate Mode Options ')}
 
@@ -1366,7 +1573,6 @@ ${FORMAT.invert(' Import Mode Options ')}
   --target <dir>, -tg <dir>        Target directory for import (default: current directory ".")
                                    Directory will be created if it doesn't exist.
   --dry-run, -dr                   Show what would happen without making changes.
-  ${FORMAT.gray('--ignore-checksum, -ic')}        ${FORMAT.gray('(Removed) Checksum comparison is now default behavior.')}
 
 ${FORMAT.invert(' General Options ')}
 
@@ -1379,10 +1585,10 @@ ${FORMAT.bold('Examples:')}
   ${FORMAT.gray('# Generate, excluding *.log files and limiting total size')}
   node codedigest.mjs -i "*.log" -t 50MB
 
-  ${FORMAT.gray('# Import digest, creating/updating files in ./output_dir')}
+  ${FORMAT.gray('# Import digest (containing files and/or diffs) into ./output_dir')}
   node codedigest.mjs --import my_digest.txt --target ./output_dir
 
-  ${FORMAT.gray('# Dry run import to see changes based on checksum comparison')}
+  ${FORMAT.gray('# Dry run import to see changes from files and diffs')}
   node codedigest.mjs --import my_digest.txt -tg ./output_dir --dry-run
 `);
 }
@@ -1431,14 +1637,14 @@ function validateArgs(args) {
         errors.push(`Include file not found: ${args.includeFile}`);
      }
      if (!args.path) {
-         errors.push('--path is required for generate mode (or default to ".")');
+         // Default path is '.', which is fine. No error needed.
      } else if (!existsSync(args.path)) {
          errors.push(`Input path not found: ${args.path}`);
      } else if (!lstatSync(args.path).isDirectory()) {
          errors.push(`Input path is not a directory: ${args.path}`);
      }
      if (!args.outputFile) {
-         errors.push('--output file path is required (or default to "digest.txt")');
+         // Default output is 'digest.txt', which is fine. No error needed.
      }
   }
   // Validate import-specific args if in import mode
@@ -1447,7 +1653,7 @@ function validateArgs(args) {
          errors.push(`Import digest file not found: ${args.import}`);
       }
       if (!args.target) {
-          errors.push('--target directory is required for import mode (or default to ".")');
+          // Default target is '.', which is fine. No error needed.
       }
       // Target dir existence is checked/created later, but we could check if parent exists?
       // For now, let importDigest handle creation/errors.
@@ -1472,7 +1678,6 @@ function parseArgs() {
     // Import defaults
     import: null, target: '.',
     dryRun: false,
-    // ignoreChecksum removed
     // General defaults
     quiet: false, ultraQuiet: false,
     help: false
@@ -1530,10 +1735,6 @@ function parseArgs() {
         parsed.target = argv[++i]; break;
       case '--dry-run': case '-dr':
         parsed.dryRun = true; break;
-      case '--ignore-checksum': case '-ic':
-        // Removed - flag is ignored now
-        console.warn(FORMAT.yellow(`Warning: Option ${arg} is deprecated and ignored. Checksum comparison is now default.`));
-        break;
 
       // General options
       case '--quiet': case '-q':
@@ -1559,9 +1760,11 @@ function parseArgs() {
 
   // Can't have both generate and import options conflicting
   // If --import is set, it's import mode. Otherwise generate mode.
-  if (parsed.import && (parsed.outputFile !== 'digest.txt' || parsed.path !== '.')) {
+  if (parsed.import && (parsed.outputFile !== 'digest.txt' || parsed.path !== '.' || parsed.ignoreFile || parsed.includeFile || parsed.ignorePatterns.length > 0 || parsed.includePatterns.length > 0)) {
       // Warn if generate-specific options were provided alongside --import?
-      // For now, let validation catch specific conflicts if needed.
+      if (!parsed.ultraQuiet) {
+          console.warn(FORMAT.yellow("Warning: Generate-specific options (like --output, --ignore, --include) are ignored when using --import."));
+      }
   }
 
 
@@ -1618,7 +1821,7 @@ async function main() {
         console.log(`Digest file: ${FORMAT.gray(resolve(args.import))}`);
         console.log(`Target dir:  ${FORMAT.gray(resolve(targetDir))}`);
         if (args.dryRun) console.log(FORMAT.yellow('Mode:        Dry Run (no changes will be made)'));
-        console.log(FORMAT.white('Compare:     Checksum of digest content vs. disk content'));
+        console.log(FORMAT.white('Processing:  Full files (via checksum) and git diffs (via patch)'));
         console.log('-----------------------------');
       }
 
@@ -1627,7 +1830,6 @@ async function main() {
         targetDir,
         args.dryRun,
         args.quiet // Pass combined quiet/ultra-quiet status
-        // ignoreChecksum removed
       );
 
       if (!args.ultraQuiet) {
@@ -1719,11 +1921,10 @@ async function main() {
       options // Pass options
     );
 
-    // 7) Build File Content Digest String (NO CHECKSUM LINE)
+    // 7) Build File Content Digest String
     const digestContent = files
       .sort((a, b) => a.path.localeCompare(b.path)) // Sort files by path for consistent output
       .map((file) => {
-        // Removed checksum calculation during generation
         // Ensure content ends with a newline for cleaner separation, unless it's empty
         const contentWithNewline = file.content.length > 0 && !file.content.endsWith('\n')
             ? file.content + '\n'
