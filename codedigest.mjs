@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * codedigest.mjs - A Node.js script to generate a digest of a directory's structure and file contents.
+ * codedigest.mjs - A Node.js script to generate a digest of a directory's structure and file contents,
+ *                  or import a digest to recreate the structure.
  */
 
 import {
@@ -14,6 +15,8 @@ import {
   join, extname, dirname, relative, resolve, sep, normalize
 } from 'node:path';
 
+import { createHash } from 'node:crypto';
+
 ////////////////////////////////////////////////////////////////////////////////
 // Constants
 ////////////////////////////////////////////////////////////////////////////////
@@ -22,6 +25,11 @@ const MAX_FILE_SIZE        = 10 * 1024 * 1024;  // 10 MB
 const MAX_DIRECTORY_DEPTH  = 20;
 const MAX_TOTAL_SIZE_BYTES = 500 * 1024 * 1024; // 500 MB
 const CHUNK_SIZE           = 1024 * 1024;       // 1 MB
+
+// Regular expressions for digest parsing
+const FILE_START_REGEX = /^### CODEDIGEST_FILE: (.+) ###$/;
+// CHECKSUM_REGEX is removed as checksums are no longer stored in the digest
+const FILE_END_REGEX = /^### CODEDIGEST_END ###$/;
 
 /**
  * Default gitignore-style patterns to exclude.
@@ -226,63 +234,97 @@ function matchesRule(pathSegments, rule) {
   if (rule.anchored) {
     return matchSegments(pathSegments, 0, rule.segments, 0, rule.directoryOnly);
   }
-  for (let start = 0; start <= pathSegments.length; start++) {
-    if (matchSegments(pathSegments, start, rule.segments, 0, rule.directoryOnly)) {
-      return true;
-    }
+  // Non-anchored means it can match anywhere in the path
+  // If rule has segments, match from any point in pathSegments
+  if (rule.segments.length > 0) {
+      for (let start = 0; start < pathSegments.length; start++) {
+          if (matchSegments(pathSegments, start, rule.segments, 0, rule.directoryOnly)) {
+              return true;
+          }
+      }
+  } else {
+      // If rule has no segments (e.g., just '*' or 'a?c'), it implicitly needs to match against *some* segment
+      // This case might be less common or need refinement based on exact gitignore behavior for empty/root patterns.
+      // Let's assume it should match against the last segment if not anchored? Or any? Let's stick to matching from any point.
+       for (let start = 0; start < pathSegments.length; start++) {
+          if (matchSegments(pathSegments, start, rule.segments, 0, rule.directoryOnly)) {
+              return true;
+          }
+       }
   }
+
   return false;
 }
 
+
 function matchSegments(pathSegs, pIndex, patSegs, sIndex, directoryOnly) {
-  if (sIndex === patSegs.length) {
-    if (directoryOnly) {
-      return pIndex < pathSegs.length;
-    }
-    return true;
-  }
+  while (sIndex < patSegs.length) {
+      const token = patSegs[sIndex];
 
-  if (pIndex === pathSegs.length) {
-    // only match if remaining pattern is all '**'
-    for (let i = sIndex; i < patSegs.length; i++) {
-      if (patSegs[i] !== '**') {
-        return false;
+      if (token === '**') {
+          sIndex++; // Consume the '**'
+          if (sIndex === patSegs.length) {
+              // '**' at the end matches everything remaining (including possibly nothing)
+              // If directoryOnly, it must match at least one segment if pIndex is at end,
+              // but gitignore '**/' means 'match directories anywhere', so the trailing / handles that check.
+              // Let's refine: directoryOnly means the *entire* match must refer to a directory.
+              // The check for directory status happens *outside* this matching logic.
+              // For now, '**' at end just means match is successful from here.
+               return true;
+          }
+          // Try matching the rest of the pattern (patSegs[sIndex:]) against
+          // all possible remaining path segments (pathSegs[pIndex:]).
+          // This involves backtracking.
+          while (pIndex < pathSegs.length) {
+              if (matchSegments(pathSegs, pIndex, patSegs, sIndex, directoryOnly)) {
+                  return true;
+              }
+              pIndex++;
+          }
+          // If '**' is followed by something, but we've run out of path segments,
+          // see if the rest of the pattern can match an empty sequence (e.g., another '**').
+          return matchSegments(pathSegs, pIndex, patSegs, sIndex, directoryOnly);
       }
-    }
-    return true;
-  }
 
-  const token = patSegs[sIndex];
-  if (token === '**') {
-    // zero or more
-    if (matchSegments(pathSegs, pIndex, patSegs, sIndex + 1, directoryOnly)) {
-      return true;
-    }
-    for (let skip = pIndex; skip < pathSegs.length; skip++) {
-      if (matchSegments(pathSegs, skip + 1, patSegs, sIndex, directoryOnly)) {
-        return true;
+      // If we need a path segment but don't have one
+      if (pIndex === pathSegs.length) {
+          return false;
       }
-    }
-    return false;
+
+      // If the current path segment doesn't match the pattern segment
+      if (!segmentMatch(pathSegs[pIndex], token)) {
+          return false;
+      }
+
+      // Matched one segment, move to the next in both path and pattern
+      pIndex++;
+      sIndex++;
   }
 
-  // single-segment match
-  if (!segmentMatch(pathSegs[pIndex], token)) {
-    return false;
-  }
-
-  return matchSegments(pathSegs, pIndex + 1, patSegs, sIndex + 1, directoryOnly);
+  // If we consumed the whole pattern, the match is successful only if we
+  // also consumed the whole path (unless the pattern is directoryOnly,
+  // in which case matching a prefix of the path is sometimes okay, handled externally).
+  // For gitignore, generally, a pattern like 'foo/bar' should match 'foo/bar' exactly,
+  // not 'foo/bar/baz'. The 'directoryOnly' flag handles the 'foo/' case.
+   return pIndex === pathSegs.length;
 }
 
+
 function segmentMatch(pathSegment, patternSegment) {
+  // Fast path for literal match
+  if (!patternSegment.includes('*') && !patternSegment.includes('?')) {
+    return pathSegment === patternSegment;
+  }
+  // Convert glob pattern to regex
   let regexStr = '';
   for (let i = 0; i < patternSegment.length; i++) {
     const ch = patternSegment[i];
     if (ch === '*') {
-      regexStr += '[^/]*';
+      regexStr += '[^/]*'; // Matches zero or more characters except '/'
     } else if (ch === '?') {
-      regexStr += '[^/]';
+      regexStr += '[^/]'; // Matches exactly one character except '/'
     } else {
+      // Escape regex special characters
       regexStr += escapeRegex(ch);
     }
   }
@@ -290,7 +332,9 @@ function segmentMatch(pathSegment, patternSegment) {
   return re.test(pathSegment);
 }
 
+
 function escapeRegex(ch) {
+  // Escape characters with special meaning in regex
   return ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
@@ -366,71 +410,107 @@ function readFileContent(filePath, maxFileSize) {
       return `[File too large to display, size: ${formatBytes(stats.size)}]`;
     }
 
-    if (!isTextFile(filePath)) {
-      return '[Non-text file]';
+    // Perform text check before attempting to read potentially huge binary files fully
+    if (!isTextFile(filePath, stats.size)) {
+       return '[Non-text file]';
     }
 
+    // Now read the content (we know it's likely text and within size limits)
     if (stats.size > CHUNK_SIZE) {
-      const fd     = openSync(filePath, 'r');
-      const buffer = Buffer.alloc(CHUNK_SIZE);
-      let content  = '';
-      let bytesRead;
-
-      try {
-        while ((bytesRead = readSync(fd, buffer, 0, buffer.length, null)) !== 0) {
-          content += buffer.toString('utf8', 0, bytesRead);
+        // Read large text files in chunks to avoid huge buffer allocation
+        const fd = openSync(filePath, 'r');
+        let content = '';
+        const buffer = Buffer.alloc(CHUNK_SIZE);
+        let bytesRead;
+        try {
+            while ((bytesRead = readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+                content += buffer.toString('utf8', 0, bytesRead);
+                // Optional: Add a check here to break if content exceeds some reasonable limit,
+                // even if file size was initially okay (e.g., guard against decompression bombs if format allowed)
+            }
+        } finally {
+            closeSync(fd);
         }
-      } finally {
-        closeSync(fd);
-      }
-      return content;
+        return content;
+    } else {
+        // Read smaller files directly
+        return readFileSync(filePath, 'utf-8');
     }
-
-    return readFileSync(filePath, 'utf-8');
   } catch (error) {
-    return `Error reading file: ${error.message}`;
+    // Log the error more visibly during file read failure
+    console.error(FORMAT.red(`Error reading file ${filePath}: ${error.message}`));
+    return `[Error reading file: ${error.message}]`; // Indicate error in the digest content
   }
 }
 
-function isTextFile(filePath) {
+function isTextFile(filePath, fileSize = -1) {
   const textExtensions = new Set([
-    '.txt',  '.md',   '.py',  '.js',   '.java', '.c',   '.cpp',  '.h',   '.hpp',
-    '.cs',   '.go',   '.rs',  '.swift', '.rb',   '.php', '.html', '.css',
-    '.json', '.xml',  '.yaml','.yml',   '.sh',   '.bat', '.sql',  '.csv',
-    '.tsv',  '.ini',  '.cfg', '.toml',  '.lua',  '.pl',  '.pm',   '.r',
-    '.ts'
+    '.txt',  '.md',   '.log',  '.csv', '.tsv', '.json', '.xml', '.yaml', '.yml',
+    '.ini',  '.cfg',  '.toml', '.sh',  '.bash', '.zsh', '.csh', '.bat', '.cmd',
+    '.ps1',  '.py',   '.js',   '.mjs', '.ts',  '.jsx', '.tsx', '.html', '.htm',
+    '.css',  '.scss', '.sass', '.less','.styl','.php', '.java', '.rb',   '.go',
+    '.rs',   '.c',    '.h',    '.cpp', '.hpp', '.cs',  '.swift','.kt',   '.kts',
+    '.scala','.pl',   '.pm',   '.r',   '.lua', '.sql', '.gitignore', '.gitattributes',
+    '.gitmodules', 'dockerfile', 'makefile', '.editorconfig', '.env'
+    // Add more known text extensions if needed
   ]);
 
+  // Check by extension first (fastest)
   if (textExtensions.has(extname(filePath).toLowerCase())) {
     return true;
   }
 
+  // For files without recognized text extensions, try reading a small chunk
+  // Avoid reading large files just to check for null bytes
+  const sizeToRead = fileSize === -1 ? 4096 : Math.min(fileSize, 4096);
+  if (sizeToRead === 0) return true; // Empty file is considered text
+
+  let fd;
   try {
-    const buffer = readFileSync(filePath, { encoding: 'utf8', flag: 'r' });
-    return !buffer.includes('\0');
+    const buffer = Buffer.alloc(sizeToRead);
+    fd = openSync(filePath, 'r');
+    const bytesRead = readSync(fd, buffer, 0, sizeToRead, 0);
+    closeSync(fd);
+    fd = null; // Prevent double close in finally
+
+    // Check for null bytes in the buffer
+    return buffer.indexOf(0, 0, bytesRead) === -1;
+
   } catch (error) {
-    console.error(`Error checking if file is text: ${error.message}`);
+     // If we can't read it, assume it's not text or inaccessible
+    if (!error.message.includes('ENOENT')) { // Don't warn for files that vanish mid-scan
+       console.warn(FORMAT.yellow(`Could not check file type for ${filePath}: ${error.message}`));
+    }
     return false;
+  } finally {
+      if (fd !== null && fd !== undefined) { // Ensure fd is defined and not null
+          try { closeSync(fd); } catch (e) { /* ignore close error */ }
+      }
   }
 }
 
 function formatBytes(bytes, decimals = 2) {
+  if (!Number.isFinite(bytes) || bytes < 0) return 'Invalid size';
   if (bytes === 0) return '0 Bytes';
   const k     = 1024;
   const dm    = decimals < 0 ? 0 : decimals;
   const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
   const i     = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+  // Ensure i is within the bounds of the sizes array
+  const index = Math.min(i, sizes.length - 1);
+  return `${parseFloat((bytes / Math.pow(k, index)).toFixed(dm))} ${sizes[index]}`;
 }
+
 
 function processFile(filePath, maxFileSize, stats, files, rootPath, options) {
   try {
-    const fileSize = lstatSync(filePath).size;
+    const fileStats = lstatSync(filePath);
+    const fileSize = fileStats.size;
 
     if (fileSize > maxFileSize) {
       stats.skippedFiles++;
       if (!options.quiet && !options.ultraQuiet) {
-        console.warn(`${FORMAT.bold('Skipping file larger than maxFileSize:')} ${filePath}`);
+        console.warn(FORMAT.yellow(`Skipping file larger than maxFileSize (${formatBytes(maxFileSize)}): ${relative(rootPath, filePath)} (${formatBytes(fileSize)})`));
       }
       return;
     }
@@ -438,192 +518,286 @@ function processFile(filePath, maxFileSize, stats, files, rootPath, options) {
     if (stats.totalSize + fileSize > options.maxTotalSize) {
       stats.sizeLimitReached = true;
       if (!options.quiet && !options.ultraQuiet) {
-        console.warn(`${FORMAT.bold('Total size limit reached at:')} ${filePath}`);
+        console.warn(FORMAT.yellow(`Total size limit (${formatBytes(options.maxTotalSize)}) reached, skipping: ${relative(rootPath, filePath)}`));
       }
       return;
     }
 
-    if (!isTextFile(filePath)) {
-      stats.nonTextFiles++;
-      if (!options.quiet && !options.ultraQuiet) {
-        console.warn(`${FORMAT.bold('Skipping non-text file:')} ${filePath}`);
-      }
-      return;
+    // Check if text file *before* adding size, so non-text files don't count towards total size
+    if (!isTextFile(filePath, fileSize)) {
+        stats.nonTextFiles++;
+        if (!options.quiet && !options.ultraQuiet) {
+            console.log(FORMAT.gray(`Skipping non-text file: ${relative(rootPath, filePath)}`));
+        }
+        return;
     }
 
+    // Passed checks, now add size and count
     stats.totalSize += fileSize;
     stats.fileCount++;
 
-    const ext = extname(filePath).toLowerCase().slice(1);
+    const ext = extname(filePath).toLowerCase() || '.<no_ext>'; // Handle files with no extension
     stats.extensionSizes[ext] = (stats.extensionSizes[ext] || 0) + fileSize;
 
-    const relativePath = relative(rootPath, filePath);
+    const relativePath = relative(rootPath, filePath).split(sep).join('/'); // Ensure forward slashes
     files.push({
       path:    relativePath,
-      content: readFileContent(filePath, maxFileSize),
+      content: readFileContent(filePath, maxFileSize), // Read content only if included
       size:    fileSize,
     });
 
     if (!options.quiet && !options.ultraQuiet) {
-      console.log(`${FORMAT.bold('Added to digest:')} ${relativePath}`);
+      console.log(FORMAT.green(`Added: ${relativePath} (${formatBytes(fileSize)})`));
     }
   } catch (error) {
-    stats.addError(error);
-    console.error(`Error processing file ${filePath}: ${error.message}`);
+     if (error.code === 'ENOENT') {
+        // File might have been deleted between readdir and lstat, common race condition
+        if (!options.ultraQuiet) {
+             console.warn(FORMAT.yellow(`File vanished before processing: ${relative(rootPath, filePath)}`));
+        }
+     } else {
+        stats.addError(error);
+        console.error(FORMAT.red(`Error processing file ${relative(rootPath, filePath)}: ${error.message}`));
+     }
   }
 }
 
+
 function processSymlink(entryPath, targetPath, stats, files, options) {
-  const symlinkKey = `${entryPath}:${targetPath}`;
+  const resolvedEntryPath = resolve(entryPath);
+  const resolvedTargetPath = resolve(targetPath); // Resolve target fully
+
+  // Basic cycle detection for symlinks pointing within the scan root
+  const symlinkKey = `${resolvedEntryPath}->${resolvedTargetPath}`;
   if (stats.seenSymlinks.has(symlinkKey)) {
     if (!options.ultraQuiet) {
-      console.warn(`Circular symlink detected: ${entryPath} -> ${targetPath}`);
+      console.warn(FORMAT.yellow(`Symlink cycle detected, skipping: ${relative(options.rootPath, entryPath)} -> ${relative(options.rootPath, targetPath)}`));
     }
-    return [];
+    return []; // Return empty array as expected by caller
   }
   stats.seenSymlinks.add(symlinkKey);
 
+
   try {
-    const targetStat = lstatSync(targetPath);
+    // Use lstat on the *target* to determine if it's a file or directory
+    // stat() would follow the link again, lstat() checks the target itself
+    const targetStat = lstatSync(resolvedTargetPath);
+
+    // Important: Check if the symlink target points *outside* the root directory scan area.
+    // Decide on policy: Follow? Skip? For digest, probably skip to avoid unexpected content.
+    if (!resolvedTargetPath.startsWith(options.rootPath + sep) && resolvedTargetPath !== options.rootPath) {
+        if (!options.ultraQuiet) {
+            console.warn(FORMAT.yellow(`Skipping symlink pointing outside root: ${relative(options.rootPath, entryPath)} -> ${targetPath}`));
+        }
+        return [];
+    }
+
+
+    // Now handle based on target type
     if (targetStat.isDirectory()) {
-      return processDirectory(targetPath, options, stats);
+      // Recurse into the directory the symlink points to
+      // Pass the original entryPath's depth + 1
+      return processDirectory(resolvedTargetPath, { ...options, currentDepth: options.currentDepth + 1 }, stats);
+    } else if (targetStat.isFile()) {
+       // Process the file the symlink points to, but use the symlink's path for relative path calculation
+       // Check includes/excludes based on the *symlink's* path first
+       const relativeLinkPath = relative(options.rootPath, entryPath).split(sep).join('/');
+       if (isPathExcluded(relativeLinkPath, options.ignoreRules, stats)) {
+           stats.filteredFiles++;
+           return [];
+       }
+       if (!isPathIncluded(relativeLinkPath, options.includeRules, stats)) {
+           stats.filteredFiles++;
+           return [];
+       }
+       // If included, process the *target* file
+       processFile(resolvedTargetPath, options.maxFileSize, stats, files, options.rootPath, options);
+       return []; // processFile adds to 'files' directly, return empty here
     } else {
-      processFile(targetPath, options.maxFileSize, stats, files, options.rootPath, options);
-      return [];
+       // Target is something else (socket, fifo, etc.) - skip
+       if (!options.ultraQuiet) {
+            console.warn(FORMAT.gray(`Skipping symlink to non-file/dir: ${relative(options.rootPath, entryPath)} -> ${targetPath}`));
+       }
+       return [];
     }
   } catch (err) {
-    if (!options.ultraQuiet) {
-      console.warn(`Broken symlink or permission error: ${entryPath} -> ${targetPath}`);
+    if (err.code === 'ENOENT') {
+       if (!options.ultraQuiet) {
+         console.warn(FORMAT.yellow(`Broken symlink: ${relative(options.rootPath, entryPath)} -> ${targetPath}`));
+       }
+    } else if (err.code === 'EACCES') {
+       if (!options.ultraQuiet) {
+         console.warn(FORMAT.red(`Permission error accessing symlink target: ${relative(options.rootPath, entryPath)} -> ${targetPath}`));
+       }
+       stats.addError(new Error(`Permission error for symlink target ${targetPath}: ${err.message}`));
+    } else {
+       if (!options.ultraQuiet) {
+          console.error(FORMAT.red(`Error processing symlink ${relative(options.rootPath, entryPath)}: ${err.message}`));
+       }
+       stats.addError(err);
     }
-    return [];
+    return []; // Return empty array on error
   }
 }
 
+
 ////////////////////////////////////////////////////////////////////////////////
-// Directory Processing (Always Recurse, Only Apply Includes to Files)
+// Directory Processing
 ////////////////////////////////////////////////////////////////////////////////
 
 function processDirectory(
   dirPath,
-  {
+  options, // Destructure options for clarity
+  stats = createStats()
+) {
+   const {
     ignoreRules,
     includeRules,
     maxFileSize     = MAX_FILE_SIZE,
     maxTotalSize    = MAX_TOTAL_SIZE_BYTES,
     maxDepth        = MAX_DIRECTORY_DEPTH,
     currentDepth    = 0,
-    rootPath        = dirPath,
-    quiet,
-    ultraQuiet,
-  },
-  stats = createStats()
-) {
+    rootPath,       // Expect rootPath to always be provided and resolved
+    quiet           = false,
+    ultraQuiet      = false,
+  } = options;
+
+
   /** @type {FileInfo[]} */
   const files = [];
 
   if (currentDepth > maxDepth) {
     if (!ultraQuiet) {
-      console.warn(`Max directory depth reached at ${dirPath}`);
+      console.warn(FORMAT.yellow(`Max directory depth (${maxDepth}) reached, stopping descent at: ${relative(rootPath, dirPath)}`));
     }
-    return files;
+    return files; // Return collected files up to this point
   }
 
-  const resolvedPath = resolve(dirPath);
-  if (stats.seenPaths.has(resolvedPath)) {
+  const resolvedDirPath = resolve(dirPath);
+
+  // Cycle detection for directories (via symlinks mostly, but also hard links if OS supports dir hard links)
+  if (stats.seenPaths.has(resolvedDirPath)) {
     if (!ultraQuiet) {
-      console.warn(`Circular reference detected at ${dirPath}, skipping.`);
+      console.warn(FORMAT.yellow(`Directory cycle detected, skipping: ${relative(rootPath, dirPath)}`));
     }
     return files;
   }
-  stats.seenPaths.add(resolvedPath);
+  stats.seenPaths.add(resolvedDirPath);
 
   let entries = [];
   try {
-    entries = readdirSync(dirPath, { withFileTypes: true });
+    entries = readdirSync(resolvedDirPath, { withFileTypes: true });
   } catch (error) {
-    stats.addError(error);
-    if (!ultraQuiet) {
-      console.error(`Error reading directory ${dirPath}: ${error.message}`);
-    }
-    return files;
+    if (error.code === 'EACCES') {
+       if (!ultraQuiet) {
+          console.error(FORMAT.red(`Permission error reading directory ${relative(rootPath, dirPath)}: ${error.message}`));
+       }
+       stats.addError(new Error(`Permission error reading directory ${resolvedDirPath}: ${error.message}`));
+    } else if (error.code !== 'ENOENT') { // Ignore if dir vanished
+       if (!ultraQuiet) {
+          console.error(FORMAT.red(`Error reading directory ${relative(rootPath, dirPath)}: ${error.message}`));
+       }
+       stats.addError(error);
+    } // else: Ignore ENOENT quietly
+    return files; // Cannot proceed with this directory
   }
 
   for (const entry of entries) {
     if (stats.sizeLimitReached) {
-      break;
+       // No need for message here, already warned in processFile
+       break; // Stop processing entries in this directory
     }
 
-    const entryPath = join(dirPath, entry.name);
+    const entryPath = join(resolvedDirPath, entry.name); // Use resolved dir path
+    // Calculate relative path from the original root for consistent filtering/output
     const relativePath = relative(rootPath, entryPath);
+    // Ensure forward slashes for matching rules
     const forwardSlashed = normalize(relativePath).split(sep).join('/');
 
-    // First, check if ignored
-    if (isPathExcluded(forwardSlashed, ignoreRules, stats)) {
+    // --- Filtering Logic ---
+
+    // 1. Check if the path itself is ignored.
+    // Important: For directories, check if the *directory path* matches an ignore rule.
+    // If a directory is ignored, we don't recurse into it at all.
+    let isDir = entry.isDirectory();
+    let isLink = entry.isSymbolicLink();
+    let isIgnored = isPathExcluded(forwardSlashed, ignoreRules, stats);
+
+    if (isIgnored) {
       stats.filteredFiles++;
-      continue;
-    }
-
-    // If it's a symlink, handle symlink logic
-    if (entry.isSymbolicLink()) {
-      try {
-        const targetPath = resolve(dirname(entryPath), readlinkSync(entryPath));
-        const symlinked = processSymlink(entryPath, targetPath, stats, files, {
-          ignoreRules,
-          includeRules,
-          maxFileSize,
-          maxTotalSize,
-          maxDepth,
-          currentDepth: currentDepth + 1,
-          rootPath,
-          quiet,
-          ultraQuiet,
-        });
-        files.push(...symlinked);
-      } catch (error) {
-        stats.addError(error);
-        if (!ultraQuiet) {
-          console.error(`Error processing symlink ${entryPath}: ${error.message}`);
-        }
+      // Log only if verbose enough and if it wasn't the output file itself (already excluded silently)
+      // Requires checking if the ignored path matches the output file pattern added earlier if desired.
+      if (!quiet && !ultraQuiet /* && !isOutputRelPath */) {
+         console.log(FORMAT.gray(`Excluded by pattern: ${forwardSlashed}${isDir ? '/' : ''}`));
       }
-      continue;
+      continue; // Skip this entry entirely
     }
 
-    // If it's a directory, always recurse unless it's ignored
-    if (entry.isDirectory()) {
+    // 2. Handle entry types
+    if (isLink) {
+      try {
+        // Resolve the target path relative to the directory containing the link
+        const targetPath = readlinkSync(entryPath);
+        // The target needs to be resolved fully for `processSymlink`
+        const resolvedTargetPath = resolve(dirname(entryPath), targetPath);
+
+        // Pass the *current* depth, processSymlink will handle depth increment if it recurses
+        const symlinkedFiles = processSymlink(entryPath, resolvedTargetPath, stats, files, {
+            ...options, // Pass all options down
+            currentDepth: currentDepth // Depth increases *inside* processSymlink if it calls processDirectory
+        });
+        files.push(...symlinkedFiles); // Add files found by following the link (if any)
+
+      } catch (error) {
+          // Handle errors from readlink itself (e.g., permissions)
+          if (error.code === 'ENOENT' && !ultraQuiet) {
+             console.warn(FORMAT.yellow(`Symlink vanished before readlink: ${forwardSlashed}`));
+          } else if (error.code !== 'ENOENT') {
+             if (!ultraQuiet) {
+                 console.error(FORMAT.red(`Error reading symlink ${forwardSlashed}: ${error.message}`));
+             }
+             stats.addError(error);
+          } // Ignore ENOENT quietly
+      }
+      continue; // Handled symlink, move to next entry
+    }
+
+    if (isDir) {
+      // Recurse into subdirectory. Pass depth+1.
       const subFiles = processDirectory(
         entryPath,
-        {
-          ignoreRules,
-          includeRules,
-          maxFileSize,
-          maxTotalSize,
-          maxDepth,
-          currentDepth: currentDepth + 1,
-          rootPath,
-          quiet,
-          ultraQuiet,
-        },
-        stats
+        { ...options, currentDepth: currentDepth + 1 }, // Pass options, increment depth
+        stats // Pass the same stats object
       );
       files.push(...subFiles);
-      continue;
+      continue; // Handled directory, move to next entry
     }
 
-    // If it's a file, now check if included
-    if (!isPathIncluded(forwardSlashed, includeRules, stats)) {
-      stats.filteredFiles++;
-      continue;
-    }
+    // 3. Handle Files: Check include patterns *only* for files.
+    if (entry.isFile()) {
+        if (!isPathIncluded(forwardSlashed, includeRules, stats)) {
+          stats.filteredFiles++;
+           if (!quiet && !ultraQuiet) {
+               console.log(FORMAT.gray(`Filtered out (no include match): ${forwardSlashed}`));
+           }
+          continue; // Skip file, does not match include rules
+        }
 
-    // If we get here, it's a file that is not ignored and is included => process it
-    processFile(entryPath, maxFileSize, stats, files, rootPath, {
-      quiet,
-      ultraQuiet,
-    });
-  }
+        // If we get here, it's a file that is:
+        // - Not ignored by ignore rules
+        // - Matches include rules (or no include rules specified)
+        processFile(entryPath, maxFileSize, stats, files, rootPath, options);
+    } else {
+        // Entry is not a file, directory, or symlink (socket, fifo, etc.)
+        if (!ultraQuiet) {
+            console.log(FORMAT.gray(`Skipping unsupported file type: ${forwardSlashed}`));
+        }
+    }
+  } // End loop through entries
 
   return files;
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Directory Tree
@@ -636,105 +810,204 @@ function generateDirectoryTree(
   maxDepth,
   currentDepth = 0,
   prefix = '',
-  rootPath = dirPath,
-  result = { content: '', truncated: false },
-  ultraQuiet = false
+  rootPath = dirPath, // Initialize rootPath here if called externally
+  result = { content: '', truncated: false, count: 0 }, // Add count to limit nodes
+  ultraQuiet = false,
+  options // Pass ProcessingOptions for consistency, though only need rules/depth
 ) {
-  if (currentDepth > maxDepth || result.truncated) {
-    return result.content;
+  const MAX_TREE_NODES = 5000; // Limit tree complexity
+
+  if (currentDepth > maxDepth || result.truncated || result.count > MAX_TREE_NODES) {
+      if (result.count > MAX_TREE_NODES && !result.truncated) {
+          result.content += `${prefix}[Tree truncated - too many entries]\n`;
+          result.truncated = true;
+      }
+      // Don't add depth message if already truncated for other reasons
+      else if (currentDepth > maxDepth && !result.truncated) {
+          result.content += `${prefix}[Tree truncated - max depth reached]\n`;
+          result.truncated = true;
+      }
+    return result.content; // Return immediately if limits reached
   }
 
   let entries = [];
+  const resolvedDirPath = resolve(dirPath); // Use resolved path
   try {
-    entries = readdirSync(dirPath, { withFileTypes: true });
+      // Use resolved path for reading directory
+      entries = readdirSync(resolvedDirPath, { withFileTypes: true });
   } catch (error) {
-    if (!ultraQuiet) {
-      console.error(`Error generating directory tree for ${dirPath}: ${error.message}`);
-    }
-    return result.content;
+      // Avoid crashing tree generation on permission errors
+      if (!ultraQuiet) {
+          const relPath = relative(rootPath, resolvedDirPath);
+          console.error(FORMAT.red(`Error reading directory for tree view ${relPath}: ${error.message}`));
+      }
+      result.content += `${prefix}└── [Error reading directory: ${error.code || error.message}]\n`;
+      result.count++;
+      return result.content; // Don't proceed further down this branch
   }
 
-  // We use a similar approach:
-  // - Skip if path is excluded, but always show directories (unless excluded).
-  // - Only show file if it's included.
-  const filtered = entries.filter((entry) => {
-    const relPath = relative(rootPath, join(dirPath, entry.name));
+  // Filter entries based on ignore/include rules for *display* in the tree
+  const displayEntries = entries.filter((entry) => {
+    const entryPath = join(resolvedDirPath, entry.name);
+    const relPath = relative(rootPath, entryPath);
     const fwd = normalize(relPath).split(sep).join('/');
 
-    // If ignored, skip
-    if (isPathExcluded(fwd, ignoreRules, null)) {
+    // If ignored, skip entirely from the tree view
+    if (isPathExcluded(fwd, ignoreRules, null)) { // Pass null for stats - not collecting stats here
       return false;
     }
 
-    // If directory, we keep it in the tree for traversal
+    // If it's a directory or symlink, always include in the tree for structure,
+    // unless it was explicitly ignored above. Recursion will handle nested filtering.
     if (entry.isDirectory() || entry.isSymbolicLink()) {
       return true;
     }
 
-    // If a file, we also check isPathIncluded
-    return isPathIncluded(fwd, includeRules, null);
-  });
-
-  filtered.forEach((entry, index) => {
-    if (result.content.length > CHUNK_SIZE) {
-      result.truncated = true;
-      return;
+    // If it's a file, only include it in the tree if it matches include rules
+    // (or if there are no include rules).
+    if (entry.isFile()) {
+       return isPathIncluded(fwd, includeRules, null); // Pass null for stats
     }
 
-    const isLast = index === filtered.length - 1;
-    const entryPath = join(dirPath, entry.name);
-    const line = `${prefix}${isLast ? '└── ' : '├── '}${entry.name}${entry.isDirectory() ? '/' : ''}\n`;
-    result.content += line;
+    // Ignore other types (sockets, etc.) in the tree view
+    return false;
+  }).sort((a, b) => {
+      // Sort directories first, then files, then alphabetically
+      const aIsDir = a.isDirectory() || a.isSymbolicLink(); // Treat links like dirs for sorting
+      const bIsDir = b.isDirectory() || b.isSymbolicLink();
+      if (aIsDir && !bIsDir) return -1;
+      if (!aIsDir && bIsDir) return 1;
+      return a.name.localeCompare(b.name); // Alphabetical for same type
+  });
 
+
+  displayEntries.forEach((entry, index) => {
+    // Check truncation conditions *before* processing the entry
+    if (result.truncated || result.count > MAX_TREE_NODES) {
+        if (!result.truncated) { // Add truncation message only once
+            result.content += `${prefix}${isLast ? '└── ' : '├── '}[Tree truncated - too many entries]\n`;
+            result.truncated = true;
+        }
+        return; // Stop processing further entries at this level
+    }
+
+    const isLast = index === displayEntries.length - 1;
+    const connector = isLast ? '└── ' : '├── ';
+    const entryPath = join(resolvedDirPath, entry.name); // Use resolved path
+    let displayName = entry.name;
+    let targetInfo = '';
+
+    if (entry.isDirectory()) {
+      displayName += '/';
+    } else if (entry.isSymbolicLink()) {
+        displayName += ' ->';
+        try {
+           const target = readlinkSync(entryPath);
+           // Try to resolve relative to root for display clarity if possible
+           const absTarget = resolve(dirname(entryPath), target);
+           if (absTarget.startsWith(rootPath + sep)) {
+               targetInfo = ` ${relative(rootPath, absTarget).split(sep).join('/')}`;
+           } else {
+               targetInfo = ` ${target}`; // Show raw target if outside root
+           }
+
+        } catch (e) {
+           targetInfo = ' [Broken Link]';
+        }
+    }
+    // Only add file size if not quiet/ultraQuiet? Maybe always add for tree? Let's add it.
+    // else if (entry.isFile()) {
+    //    try {
+    //       const size = lstatSync(entryPath).size;
+    //       targetInfo = ` (${formatBytes(size)})`;
+    //    } catch (e) { /* ignore stat error for tree */ }
+    // }
+
+
+    result.content += `${prefix}${connector}${displayName}${targetInfo}\n`;
+    result.count++;
+
+
+    // Recurse ONLY if it's a directory and we haven't hit limits
     if (entry.isDirectory() && !result.truncated) {
+      const newPrefix = `${prefix}${isLast ? '    ' : '│   '}`;
       generateDirectoryTree(
-        entryPath,
+        entryPath, // Pass resolved path for recursion
         ignoreRules,
         includeRules,
         maxDepth,
-        currentDepth + 1,
-        `${prefix}${isLast ? '    ' : '│   '}`,
-        rootPath,
-        result,
-        ultraQuiet
+        currentDepth + 1, // Increment depth
+        newPrefix,
+        rootPath, // Pass rootPath consistently
+        result, // Pass the *same* result object
+        ultraQuiet,
+        options // Pass options down
       );
     }
+    // Do NOT recurse into symlink targets for the *tree view* to avoid loops/complexity
+    // The processDirectory function handles following links for content gathering.
   });
 
-  return result.truncated
-    ? result.content + '\n[Directory tree truncated due to size]'
-    : result.content;
+  return result.content; // Return the final accumulated content
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Summary & Reporting
 ////////////////////////////////////////////////////////////////////////////////
 
 function calculateExtensionPercentages(extensionSizes, totalSize) {
+  if (totalSize === 0) return {}; // Avoid division by zero
+
   const percentages = {};
+  let otherSize = 0;
+  const MIN_PERCENTAGE_THRESHOLD = 0.5; // Group small extensions
+
+  // Calculate percentages
   for (const ext in extensionSizes) {
-    percentages[ext] = totalSize > 0
-      ? (extensionSizes[ext] / totalSize) * 100
-      : 0;
+    const percent = (extensionSizes[ext] / totalSize) * 100;
+    if (percent >= MIN_PERCENTAGE_THRESHOLD) {
+      percentages[ext] = percent;
+    } else {
+      otherSize += extensionSizes[ext];
+    }
   }
+
+  // Add 'other' category if needed
+  if (otherSize > 0) {
+     const otherPercent = (otherSize / totalSize) * 100;
+     // Only show 'other' if it's significant enough or if there are few main categories
+     if (otherPercent >= MIN_PERCENTAGE_THRESHOLD || Object.keys(percentages).length < 5) {
+        percentages['.other'] = otherPercent;
+     } else {
+         // If 'other' is tiny and there are many main categories, distribute it slightly?
+         // Or just ignore it for cleaner graph? Let's ignore small remainder.
+     }
+  }
+
   return percentages;
 }
 
 function generateBarGraph(extensionPercentages) {
-  const { white, green } = FORMAT;
-  const barLength = 20;
+  const { white, green, gray } = FORMAT;
+  const barLength = 30; // Make bar slightly longer
   let graph = '';
 
   const sorted = Object.entries(extensionPercentages)
-    .sort(([, a], [, b]) => b - a);
+    .sort(([, a], [, b]) => b - a); // Sort descending by percentage
+
+  if (sorted.length === 0) {
+      return gray('  (No text files included)');
+  }
 
   for (const [ext, percent] of sorted) {
-    const filledBars = Math.round((percent / 100) * barLength);
-    const emptyBars  = barLength - filledBars;
-    const bar        = '█'.repeat(filledBars) + '–'.repeat(emptyBars);
-    graph += `${white(ext.padEnd(12))}: ${green(bar)} ${percent.toFixed(1)}%\n`;
+    if (percent === 0) continue; // Skip zero percent entries if any crept in
+    const filledBars = Math.max(1, Math.round((percent / 100) * barLength)); // Ensure at least one bar if > 0%
+    const emptyBars  = Math.max(0, barLength - filledBars);
+    const bar        = green('█'.repeat(filledBars)) + gray('─'.repeat(emptyBars)); // Use different colors
+    graph += `  ${white(ext.padEnd(10))}: [${bar}] ${percent.toFixed(1)}%\n`;
   }
-  return graph;
+  return graph.trimEnd(); // Remove trailing newline
 }
 
 function generateSummary(path, stats, options, outputFile) {
@@ -747,48 +1020,312 @@ function generateSummary(path, stats, options, outputFile) {
   );
   const barGraph = generateBarGraph(extensionPercentages);
 
+  // Helper to format pattern lists
+  const formatPatternList = (patternSet) => {
+      if (patternSet.size === 0) return gray('  None');
+      return Array.from(patternSet)
+          .map(p => `  ${gray(p)}`)
+          .join('\n');
+  };
+
   return `
-${invert(bold(' Digest Summary '))}
-${white('Processed directory:')}         ${gray(resolve(path))}
-${white('Execution time:')}              ${yellow((executionTime / 1000).toFixed(2))} ${gray('seconds')}
-${white('Files added to digest:')}       ${green(stats.fileCount.toString())}
-${white('Files excluded by pattern:')}   ${red(stats.filteredFiles.toString())}
-${white('Files excluded (non-text):')}   ${red(stats.nonTextFiles.toString())}
-${white('Files skipped (size limit):')}  ${red(stats.skippedFiles.toString())}
-${white('Total size:')}                  ${yellow(formatBytes(stats.totalSize))}
-${white('Size limit reached:')}          ${stats.sizeLimitReached ? red('Yes') : green('No')}
+${invert(bold(' Code Digest Summary '))}
+${white('Processed Path:')}          ${gray(resolve(path))}
+${white('Output File:')}             ${gray(outputFile ? resolve(outputFile) : 'N/A')}
+${white('Execution Time:')}          ${yellow((executionTime / 1000).toFixed(2))} ${gray('seconds')}
+
+${invert(bold(' Content Stats '))}
+${white('Text Files Included:')}     ${green(stats.fileCount.toString())}
+${white('Total Size Included:')}     ${yellow(formatBytes(stats.totalSize))} ${stats.sizeLimitReached ? red('(Limit Reached)') : ''}
+${white('Files Excluded:')}
+${white('  by ignore pattern:')}    ${red(stats.filteredFiles.toString())}
+${white('  non-text files:')}       ${red(stats.nonTextFiles.toString())}
+${white('  size > max_file:')}      ${red(stats.skippedFiles.toString())}
 
 ${invert(bold(' Configuration '))}
-${white('Max file size:')}       ${yellow(formatBytes(options.maxFileSize))}
-${white('Max total size:')}      ${yellow(formatBytes(options.maxTotalSize))}
-${white('Max directory depth:')} ${yellow(options.maxDepth)}
+${white('Max File Size:')}           ${yellow(formatBytes(options.maxFileSize))}
+${white('Max Total Size:')}          ${yellow(formatBytes(options.maxTotalSize))}
+${white('Max Directory Depth:')}     ${yellow(options.maxDepth)}
+${white('Follow Symlinks:')}         ${yellow('Yes (within root)')}
 
-${bold('Ignore patterns that matched:')} ${
-    stats.matchedIgnorePatterns.size > 0
-      ? `\n  ${gray(Array.from(stats.matchedIgnorePatterns).join('\n  '))}`
-      : 'None'
-}
+${invert(bold(' Filters Applied '))}
+${bold('Ignore Patterns Matched:')}
+${formatPatternList(stats.matchedIgnorePatterns)}
+${bold('Include Patterns Matched:')}
+${formatPatternList(stats.matchedIncludePatterns)}
 
-${bold('Include patterns that matched:')} ${
-    stats.matchedIncludePatterns.size > 0
-      ? `\n  ${gray(Array.from(stats.matchedIncludePatterns).join('\n  '))}`
-      : 'None'
-}
-
-${invert(bold(' File Size by Extension '))}
+${invert(bold(' Size by Extension (Included Text Files) '))}
 ${barGraph}
 
 ${invert(bold(` Errors (${stats.errors.length}) `))}
 ${
     stats.errors.length
-      ? stats.errors.map((err) => `${err.timestamp}: ${err.message}`).join('\n')
-      : 'No errors occurred'
+      ? stats.errors.map((err) => gray(`  ${err.timestamp}: ${err.message}`)).join('\n')
+      : gray('  No errors reported.')
 }
-
-${invert(bold(' Digest File '))}
-${outputFile}
 `;
 }
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Import Digest
+////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Parse a digest file and extract file paths and content.
+ * Assumes strict format where every file block ends with CODEDIGEST_END.
+ * Checksum lines are ignored.
+ *
+ * @param {string} digestContent - Content of the digest file
+ * @returns {Array<{path: string, content: string}>} - Array of file info (path and content only)
+ */
+function parseDigestContent(digestContent) {
+  const lines = digestContent.split(/\r?\n/);
+  /** @type {Array<{path: string, content: string}>} */
+  const files = [];
+
+  let currentFile = null;
+  let currentContent = [];
+  // Removed currentChecksum and inHeader logic related to checksum
+
+  for (const line of lines) {
+    const fileMatch = line.match(FILE_START_REGEX);
+    // Removed checksumMatch
+    const endMatch = line.match(FILE_END_REGEX);
+
+    if (fileMatch) {
+      // New file section starts
+      if (currentFile !== null) {
+        // If we were in a file block but didn't see an END marker, it's malformed.
+        console.warn(FORMAT.yellow(`Warning: Malformed entry detected. File section for '${currentFile}' started but was interrupted by a new file section before an END marker.`));
+      }
+      // Reset for new file
+      currentFile = fileMatch[1];
+      currentContent = [];
+      // Removed checksum reset
+    }
+    // Removed checksum parsing logic
+    else if (currentFile !== null && endMatch) {
+      // End of file section - push the file path and content.
+      files.push({
+        path: currentFile,
+        content: currentContent.join('\n'),
+        // checksum property removed
+      });
+      // Reset state
+      currentFile = null;
+      currentContent = [];
+      // Removed checksum reset
+    } else if (currentFile !== null) {
+      // Line belongs to the current file's content
+      // Check if it's the checksum line and ignore it if present (for backward compatibility)
+      if (!line.match(/^### CHECKSUM: [a-f0-9]+ ###$/)) {
+          currentContent.push(line);
+      }
+    }
+    // Ignore lines outside of file blocks or checksum lines
+  }
+
+  // Check if the loop ended while inside a file block without an END marker
+  if (currentFile !== null) {
+      console.warn(FORMAT.yellow(`Warning: Malformed digest. End of input reached while processing file section for '${currentFile}' without an END marker.`));
+      // Do NOT add this potentially incomplete file based on the strict format requirement.
+  }
+
+  return files;
+}
+
+
+/**
+ * Import files from a digest and create/update files in the target directory.
+ * Compares checksum of digest content against checksum of existing file content.
+ *
+ * @param {string} digestFilePath - Path to the digest file
+ * @param {string} targetDir - Directory where files should be created/updated
+ * @param {boolean} dryRun - If true, don't actually create/update files
+ * @param {boolean} quiet - If true, reduce console output
+ * @returns {Object} Summary of import operation
+ */
+function importDigest(digestFilePath, targetDir, dryRun, quiet) {
+  const summary = {
+    created: [],
+    updated: [],
+    unchanged: [],
+    skippedOutsideTarget: [],
+    errors: []
+    // checksumMismatch category removed
+  };
+
+  if (!existsSync(digestFilePath)) {
+    throw new Error(`Digest file not found: ${digestFilePath}`);
+  }
+
+   const resolvedBaseTargetDir = resolve(targetDir);
+   if (!quiet) console.log(`Resolved target directory: ${resolvedBaseTargetDir}`);
+
+  // Ensure the base target directory exists if not in dry run
+  if (!dryRun && !existsSync(resolvedBaseTargetDir)) {
+      try {
+          mkdirSync(resolvedBaseTargetDir, { recursive: true });
+          if (!quiet) console.log(FORMAT.green(`Created base target directory: ${resolvedBaseTargetDir}`));
+      } catch (error) {
+          throw new Error(`Failed to create target directory ${resolvedBaseTargetDir}: ${error.message}`);
+      }
+  }
+
+  const digestContent = readFileSync(digestFilePath, 'utf-8');
+  const files = parseDigestContent(digestContent); // Parses path and content only
+
+  if (!quiet) console.log(`Parsed ${files.length} file entries from digest`);
+
+  for (const file of files) {
+    try {
+      // --- Path Traversal Prevention ---
+      const initialTargetPath = join(resolvedBaseTargetDir, file.path);
+      const resolvedTargetPath = resolve(initialTargetPath);
+      if (!(resolvedTargetPath.startsWith(resolvedBaseTargetDir + sep) || resolvedTargetPath === resolvedBaseTargetDir)) {
+          summary.skippedOutsideTarget.push(file.path);
+          if (!quiet) console.error(FORMAT.red(`Security Risk: Skipping ${file.path} - path resolves outside target directory '${resolvedBaseTargetDir}'`));
+          continue; // Skip this file
+      }
+      // --- End Path Traversal Prevention ---
+
+      const targetFileDir = dirname(resolvedTargetPath);
+      const fileExists = existsSync(resolvedTargetPath);
+
+      // Calculate checksum of the content *from the digest*
+      const digestContentChecksum = calculateChecksum(file.content);
+
+      let action = 'unknown'; // 'create', 'update', 'unchanged', 'error'
+      let existingFileChecksum = null;
+
+      if (fileExists) {
+          try {
+              const existingContent = readFileSync(resolvedTargetPath, 'utf-8');
+              existingFileChecksum = calculateChecksum(existingContent);
+
+              if (digestContentChecksum === existingFileChecksum) {
+                  action = 'unchanged';
+                  summary.unchanged.push(file.path);
+              } else {
+                  action = 'update';
+                  summary.updated.push(file.path);
+              }
+          } catch (readError) {
+              action = 'error';
+              summary.errors.push({ path: file.path, error: `Could not read existing file for comparison: ${readError.message}` });
+              if (!quiet) console.error(FORMAT.red(`Error reading existing file ${file.path} for comparison: ${readError.message}`));
+          }
+      } else {
+          action = 'create';
+          summary.created.push(file.path);
+      }
+
+      // Perform actions based on comparison and dryRun status
+      if (action === 'error') {
+          continue; // Skip if reading existing file failed
+      }
+
+      if (dryRun) {
+          // Log intended actions
+          if (action === 'create') {
+              if (!existsSync(targetFileDir)) {
+                 if (!quiet) console.log(`Would create directory: ${relative(process.cwd(), targetFileDir) || '.'}`);
+              }
+              if (!quiet) console.log(`Would create: ${file.path}`);
+          } else if (action === 'update') {
+              if (!quiet) console.log(`Would update: ${file.path} (Checksum differs: Digest ${digestContentChecksum} vs Disk ${existingFileChecksum})`);
+          } else if (action === 'unchanged') {
+              // Optionally log unchanged files if verbose enough
+              // if (!quiet) console.log(FORMAT.gray(`Would leave unchanged: ${file.path} (Checksum matches: ${digestContentChecksum})`));
+          }
+      } else { // Actual import
+          if (action === 'create' || action === 'update') {
+              // Ensure directory exists before writing
+              if (!existsSync(targetFileDir)) {
+                 try {
+                    mkdirSync(targetFileDir, { recursive: true });
+                 } catch (mkdirError) {
+                     summary.errors.push({ path: file.path, error: `Failed to create directory ${targetFileDir}: ${mkdirError.message}` });
+                     if (!quiet) console.error(FORMAT.red(`Error creating directory for ${file.path}: ${mkdirError.message}`));
+                     continue; // Skip this file if directory can't be made
+                 }
+              }
+              // Write the file content from the digest
+              try {
+                  writeFileSync(resolvedTargetPath, file.content);
+                  if (!quiet) {
+                      if (action === 'create') {
+                          console.log(FORMAT.green(`Created: ${file.path}`));
+                      } else { // action === 'update'
+                          console.log(FORMAT.yellow(`Updated: ${file.path}`));
+                      }
+                  }
+              } catch (writeError) {
+                  summary.errors.push({ path: file.path, error: `Failed to write file: ${writeError.message}` });
+                  if (!quiet) console.error(FORMAT.red(`Error writing file ${file.path}: ${writeError.message}`));
+              }
+          } else if (action === 'unchanged') {
+              // Log unchanged only if verbose?
+              // if (!quiet) console.log(FORMAT.gray(`Unchanged: ${file.path}`));
+          }
+      }
+    } catch (error) {
+      // Catch unexpected errors during the processing of a single file entry
+      summary.errors.push({ path: file.path || 'Unknown path', error: error.message });
+      if (!quiet) console.error(FORMAT.red(`Error processing entry for ${file.path || 'Unknown path'}: ${error.message}`));
+    }
+  } // End loop through files
+
+  return summary;
+}
+
+/**
+ * Print a summary of the import operation.
+ */
+function printImportSummary(summary, dryRun) {
+  const { bold, green, yellow, red, gray, invert } = FORMAT;
+  const actionVerb = dryRun ? 'Would be' : 'Were';
+  const actionVerbPast = dryRun ? 'Would have been' : 'Were';
+
+  console.log(`
+${invert(bold(` Import Summary ${dryRun ? '(Dry Run)' : ''} `))}
+${green(`Files ${actionVerb} created:`)}      ${summary.created.length}
+${yellow(`Files ${actionVerb} updated (checksum mismatch):`)} ${summary.updated.length}
+${gray(`Files ${actionVerb} unchanged (checksum match):`)}    ${summary.unchanged.length}
+${red(`Path outside target (skipped):`)} ${summary.skippedOutsideTarget.length}
+${red(`Other errors during processing:`)} ${summary.errors.length}
+`); // Add trailing newline for spacing
+
+  // Optionally list files, maybe limit list length?
+  const MAX_LIST = 15;
+  const printList = (label, list, color) => {
+      if (list.length > 0) {
+          console.log(`${bold(label)}`);
+          list.slice(0, MAX_LIST).forEach(f => console.log(`  ${color(f)}`));
+          if (list.length > MAX_LIST) {
+              console.log(`  ${gray(`...and ${list.length - MAX_LIST} more`)}`);
+          }
+          console.log(''); // Add space after list
+      }
+  };
+
+  printList(`${actionVerbPast} Created:`, summary.created, green);
+  printList(`${actionVerbPast} Updated (Checksum Mismatch):`, summary.updated, yellow);
+  // Don't usually need to list unchanged files
+  // printList(`${actionVerbPast} Unchanged (Checksum Match):`, summary.unchanged, gray);
+  printList('Paths Outside Target (Skipped):', summary.skippedOutsideTarget, red);
+
+  if (summary.errors.length > 0) {
+      console.log(`${bold('Errors During Processing:')}`);
+      summary.errors.slice(0, MAX_LIST).forEach(e => console.log(`  ${red(`${e.path}: ${e.error}`)}`));
+      if (summary.errors.length > MAX_LIST) {
+           console.log(`  ${gray(`...and ${summary.errors.length - MAX_LIST} more errors`)}`);
+      }
+       console.log(''); // Add space after list
+  }
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // CLI & Main
@@ -796,130 +1333,323 @@ ${outputFile}
 
 function printHelp() {
   console.log(`
-Usage: node codedigest.mjs [options]
+${FORMAT.bold('codedigest.mjs')} - Generate or import a digest of a directory's text file contents.
 
-Options:
-  --path <path>, -p <path>                   Directory to process (default: current directory)
-  --output <file>, -o <file>                 Output file path (default: digest.txt)
-  --ignore <file>, -g <file>                 File containing ignore patterns (gitignore-style)
-  --include <file>, -n <file>                File containing include patterns (gitignore-style)
-  --ignore-pattern <pattern>, -i <pattern>   Additional ignore pattern (can be used multiple times)
-  --include-pattern <pattern>, -I <pattern>  Additional include pattern (can be used multiple times)
-  --max-size <bytes>, -s <bytes>             Maximum file size (default: ${formatBytes(MAX_FILE_SIZE)})
-  --max-total-size <bytes>, -t <bytes>       Maximum total size (default: ${formatBytes(MAX_TOTAL_SIZE_BYTES)})
-  --max-depth <number>, -d <number>          Maximum directory depth (default: ${MAX_DIRECTORY_DEPTH})
-  --quiet, -q                                Suppress 'Added' and 'Skipped' messages
-  --ultra-quiet, -uq                         Suppress all non-error output
-  --skip-default-ignore, -k                  Skip default ignore patterns; use only user-provided
-  --help, -h                                 Display this help message
+${FORMAT.invert(' Modes ')}
+
+  ${FORMAT.bold('Generate Mode (Default):')} Creates a digest file from a directory.
+  ${FORMAT.bold('Import Mode:')} Creates/updates files in a directory based on a digest file.
+                 Uses checksum comparison between digest content and existing file content.
+
+${FORMAT.invert(' Generate Mode Options ')}
+
+  --path <dir>, -p <dir>           Directory to process (default: current directory ".")
+  --output <file>, -o <file>       Output digest file path (default: "digest.txt")
+  --ignore <file>, -g <file>       Load ignore patterns from a .gitignore-style file
+  --include <file>, -n <file>      Load include patterns from a .gitignore-style file
+                                   (If includes are used, only matching files are added)
+  --ignore-pattern <ptn>, -i <ptn> Add a single ignore pattern (can use multiple times)
+  --include-pattern <ptn>, -I <ptn> Add a single include pattern (can use multiple times)
+  --max-size <bytes>, -s <bytes>   Max individual file size (default: ${formatBytes(MAX_FILE_SIZE)})
+                                   Supports suffixes KB, MB, GB (e.g., 10MB)
+  --max-total-size <bytes>, -t <bytes> Max total size of all included files (default: ${formatBytes(MAX_TOTAL_SIZE_BYTES)})
+                                   Supports suffixes KB, MB, GB (e.g., 500MB)
+  --max-depth <num>, -d <num>      Max directory recursion depth (default: ${MAX_DIRECTORY_DEPTH})
+  --skip-default-ignore, -k        Do not use built-in default ignore patterns
+                                   (like node_modules, .git, build, etc.)
+  --quiet, -q                      Suppress file add/skip messages (shows summary)
+  --ultra-quiet, -uq               Suppress all output except fatal errors
+
+${FORMAT.invert(' Import Mode Options ')}
+
+  --import <file>, -im <file>      REQUIRED: Specify the digest file to import.
+  --target <dir>, -tg <dir>        Target directory for import (default: current directory ".")
+                                   Directory will be created if it doesn't exist.
+  --dry-run, -dr                   Show what would happen without making changes.
+  ${FORMAT.gray('--ignore-checksum, -ic')}        ${FORMAT.gray('(Removed) Checksum comparison is now default behavior.')}
+
+${FORMAT.invert(' General Options ')}
+
+  --help, -h                       Display this help message and exit.
+
+${FORMAT.bold('Examples:')}
+  ${FORMAT.gray('# Generate digest of src/ folder into my_digest.txt')}
+  node codedigest.mjs -p src/ -o my_digest.txt
+
+  ${FORMAT.gray('# Generate, excluding *.log files and limiting total size')}
+  node codedigest.mjs -i "*.log" -t 50MB
+
+  ${FORMAT.gray('# Import digest, creating/updating files in ./output_dir')}
+  node codedigest.mjs --import my_digest.txt --target ./output_dir
+
+  ${FORMAT.gray('# Dry run import to see changes based on checksum comparison')}
+  node codedigest.mjs --import my_digest.txt -tg ./output_dir --dry-run
 `);
 }
 
+// Helper to parse sizes like "10MB", "5GB"
+function parseSizeString(sizeStr) {
+    if (!sizeStr) return null;
+    const match = String(sizeStr).toUpperCase().match(/^(\d+)\s*(KB|MB|GB|TB)?$/);
+    if (!match) {
+        const num = parseInt(sizeStr, 10);
+        return Number.isFinite(num) && num >= 0 ? num : null;
+    }
+    const num = parseInt(match[1], 10);
+    const unit = match[2];
+    if (!Number.isFinite(num) || num < 0) return null;
+
+    switch (unit) {
+        case 'KB': return num * 1024;
+        case 'MB': return num * 1024 * 1024;
+        case 'GB': return num * 1024 * 1024 * 1024;
+        case 'TB': return num * 1024 * 1024 * 1024 * 1024;
+        default: return num; // Treat as bytes if no unit or unit unknown
+    }
+}
+
+
 function validateArgs(args) {
   const errors = [];
-  if (args.maxSize <= 0) {
-    errors.push('maxSize must be positive');
+  // Validate common args
+  if (args.maxSize !== null && args.maxSize <= 0) {
+    errors.push(`--max-size must be positive (got ${args.maxSize})`);
   }
-  if (args.maxTotalSize <= 0) {
-    errors.push('maxTotalSize must be positive');
+  if (args.maxTotalSize !== null && args.maxTotalSize <= 0) {
+    errors.push(`--max-total-size must be positive (got ${args.maxTotalSize})`);
   }
-  if (args.maxDepth <= 0) {
-    errors.push('maxDepth must be positive');
+  if (args.maxDepth !== null && args.maxDepth < 0) { // Allow 0 depth? Yes, process only root files.
+    errors.push(`--max-depth cannot be negative (got ${args.maxDepth})`);
   }
-  if (args.ignoreFile && !existsSync(args.ignoreFile)) {
-    errors.push(`Ignore file not found: ${args.ignoreFile}`);
+
+  // Validate generate-specific args if not in import mode
+  if (!args.import) {
+     if (args.ignoreFile && !existsSync(args.ignoreFile)) {
+        errors.push(`Ignore file not found: ${args.ignoreFile}`);
+     }
+     if (args.includeFile && !existsSync(args.includeFile)) {
+        errors.push(`Include file not found: ${args.includeFile}`);
+     }
+     if (!args.path) {
+         errors.push('--path is required for generate mode (or default to ".")');
+     } else if (!existsSync(args.path)) {
+         errors.push(`Input path not found: ${args.path}`);
+     } else if (!lstatSync(args.path).isDirectory()) {
+         errors.push(`Input path is not a directory: ${args.path}`);
+     }
+     if (!args.outputFile) {
+         errors.push('--output file path is required (or default to "digest.txt")');
+     }
   }
-  if (args.includeFile && !existsSync(args.includeFile)) {
-    errors.push(`Include file not found: ${args.includeFile}`);
+  // Validate import-specific args if in import mode
+  else {
+      if (!existsSync(args.import)) {
+         errors.push(`Import digest file not found: ${args.import}`);
+      }
+      if (!args.target) {
+          errors.push('--target directory is required for import mode (or default to ".")');
+      }
+      // Target dir existence is checked/created later, but we could check if parent exists?
+      // For now, let importDigest handle creation/errors.
   }
+
+
   if (errors.length > 0) {
-    throw new Error(`Invalid arguments:\n${errors.join('\n')}`);
+    throw new Error(`Invalid arguments:\n- ${errors.join('\n- ')}`);
   }
 }
 
 function parseArgs() {
   const argv = process.argv.slice(2);
   const parsed = {
+    // Generate defaults
     path: '.', outputFile: 'digest.txt',
     ignoreFile: null, includeFile: null,
     ignorePatterns: [], includePatterns: [],
     maxSize: MAX_FILE_SIZE, maxTotalSize: MAX_TOTAL_SIZE_BYTES,
     maxDepth: MAX_DIRECTORY_DEPTH,
-    quiet: false, ultraQuiet: false,
     skipDefaultIgnore: false,
+    // Import defaults
+    import: null, target: '.',
+    dryRun: false,
+    // ignoreChecksum removed
+    // General defaults
+    quiet: false, ultraQuiet: false,
+    help: false
   };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    const nextArg = argv[i + 1]; // Look ahead for value
+
     switch (arg) {
+      // Generate options
       case '--path': case '-p':
+        if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
         parsed.path = argv[++i]; break;
       case '--output': case '-o':
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
         parsed.outputFile = argv[++i]; break;
       case '--ignore': case '-g':
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
         parsed.ignoreFile = argv[++i]; break;
       case '--include': case '-n':
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
         parsed.includeFile = argv[++i]; break;
       case '--ignore-pattern': case '-i':
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
         parsed.ignorePatterns.push(argv[++i]); break;
       case '--include-pattern': case '-I':
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
         parsed.includePatterns.push(argv[++i]); break;
       case '--max-size': case '-s':
-        parsed.maxSize = parseInt(argv[++i], 10); break;
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
+        parsed.maxSize = parseSizeString(argv[++i]);
+        if (parsed.maxSize === null) throw new Error(`Invalid value for ${arg}: ${argv[i]}`);
+        break;
       case '--max-total-size': case '-t':
-        parsed.maxTotalSize = parseInt(argv[++i], 10); break;
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
+        parsed.maxTotalSize = parseSizeString(argv[++i]);
+         if (parsed.maxTotalSize === null) throw new Error(`Invalid value for ${arg}: ${argv[i]}`);
+        break;
       case '--max-depth': case '-d':
-        parsed.maxDepth = parseInt(argv[++i], 10); break;
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
+        const depth = parseInt(argv[++i], 10);
+        if (!Number.isInteger(depth)) throw new Error(`Invalid integer value for ${arg}: ${argv[i]}`);
+        parsed.maxDepth = depth;
+        break;
+      case '--skip-default-ignore': case '-k':
+        parsed.skipDefaultIgnore = true; break;
+
+       // Import options
+      case '--import': case '-im':
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
+        parsed.import = argv[++i]; break;
+      case '--target': case '-tg':
+         if (!nextArg || nextArg.startsWith('-')) throw new Error(`Option ${arg} requires a value.`);
+        parsed.target = argv[++i]; break;
+      case '--dry-run': case '-dr':
+        parsed.dryRun = true; break;
+      case '--ignore-checksum': case '-ic':
+        // Removed - flag is ignored now
+        console.warn(FORMAT.yellow(`Warning: Option ${arg} is deprecated and ignored. Checksum comparison is now default.`));
+        break;
+
+      // General options
       case '--quiet': case '-q':
         parsed.quiet = true; break;
       case '--ultra-quiet': case '-uq':
-        parsed.ultraQuiet = true; break;
-      case '--skip-default-ignore': case '-k':
-        parsed.skipDefaultIgnore = true; break;
+        // Ultra quiet implies quiet for logging purposes
+        parsed.ultraQuiet = true; parsed.quiet = true; break;
       case '--help': case '-h':
-        printHelp(); process.exit(0);
+        parsed.help = true; break; // Set flag, handle later
+
       default:
-        console.warn(`Unknown option: ${arg}`);
-        printHelp();
-        process.exit(1);
+        // Check if it's a positional argument (path or import file maybe?)
+        // For simplicity, require flags for now.
+        throw new Error(`Unknown option or missing value: ${arg}`);
     }
   }
+
+  // Post-parsing checks / adjustments
+  if (parsed.help) {
+      printHelp();
+      process.exit(0);
+  }
+
+  // Can't have both generate and import options conflicting
+  // If --import is set, it's import mode. Otherwise generate mode.
+  if (parsed.import && (parsed.outputFile !== 'digest.txt' || parsed.path !== '.')) {
+      // Warn if generate-specific options were provided alongside --import?
+      // For now, let validation catch specific conflicts if needed.
+  }
+
+
   return parsed;
 }
 
+
 function loadPatternFile(filePath) {
+  if (!filePath) return '';
   try {
     return readFileSync(filePath, 'utf-8');
   } catch (err) {
-    console.error(`Error reading pattern file ${filePath}: ${err.message}`);
-    return '';
+    // Throw a more specific error to be caught by main handler
+    throw new Error(`Failed to read pattern file ${filePath}: ${err.message}`);
   }
 }
 
-function ensureDirectoryExists(dirPath) {
-  if (!existsSync(dirPath)) {
-    mkdirSync(dirPath, { recursive: true });
-  }
+function ensureDirectoryExists(filePath) {
+   // Ensures the directory for a given *file* path exists
+   const dir = dirname(filePath);
+   if (!existsSync(dir)) {
+      try {
+        mkdirSync(dir, { recursive: true });
+      } catch (error) {
+         // Throw specific error if directory creation fails
+         throw new Error(`Failed to create output directory ${dir}: ${error.message}`);
+      }
+   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Main
+// Main Execution Logic
 ////////////////////////////////////////////////////////////////////////////////
+
+/** Calculate a short SHA256 checksum for content */
+function calculateChecksum(content) {
+  // Ensure content is a string or buffer before hashing
+  const dataToHash = (typeof content === 'string' || Buffer.isBuffer(content)) ? content : String(content);
+  return createHash('sha256').update(dataToHash, 'utf8').digest('hex').substring(0, 12);
+}
 
 async function main() {
+  let args;
   try {
-    const args = parseArgs();
-    validateArgs(args);
+    args = parseArgs();
+    validateArgs(args); // Validate after parsing all args
 
+    // --- Import Mode ---
+    if (args.import) {
+      const targetDir = args.target; // Target dir validation happens inside importDigest
+
+      if (!args.ultraQuiet) {
+        console.log(FORMAT.bold(`--- Starting Digest Import ---`));
+        console.log(`Digest file: ${FORMAT.gray(resolve(args.import))}`);
+        console.log(`Target dir:  ${FORMAT.gray(resolve(targetDir))}`);
+        if (args.dryRun) console.log(FORMAT.yellow('Mode:        Dry Run (no changes will be made)'));
+        console.log(FORMAT.white('Compare:     Checksum of digest content vs. disk content'));
+        console.log('-----------------------------');
+      }
+
+      const summary = importDigest(
+        args.import,
+        targetDir,
+        args.dryRun,
+        args.quiet // Pass combined quiet/ultra-quiet status
+        // ignoreChecksum removed
+      );
+
+      if (!args.ultraQuiet) {
+        printImportSummary(summary, args.dryRun);
+      }
+
+      // Exit successfully after import
+      process.exit(0);
+    }
+
+    // --- Generate Mode ---
     const rootPath       = resolve(args.path);
     const outputFilePath = resolve(args.outputFile);
 
-    if (!existsSync(rootPath)) {
-      throw new Error(`Path does not exist: ${args.path}`);
+    if (!args.ultraQuiet) {
+        console.log(FORMAT.bold(`--- Starting Digest Generation ---`));
+        console.log(`Processing: ${FORMAT.gray(rootPath)}`);
+        console.log(`Outputting to: ${FORMAT.gray(outputFilePath)}`);
+        console.log(`Max file size: ${FORMAT.yellow(formatBytes(args.maxSize))}, Max total size: ${FORMAT.yellow(formatBytes(args.maxTotalSize))}, Max depth: ${FORMAT.yellow(args.maxDepth)}`);
+        console.log('--------------------------------');
     }
-    if (!lstatSync(rootPath).isDirectory()) {
-      throw new Error(`Path is not a directory: ${args.path}`);
-    }
+
 
     // 1) Build final ignoreRules
     let ignoreText = '';
@@ -944,75 +1674,106 @@ async function main() {
     }
     const includeRules = parseGitignore(includeText);
 
-    // Exclude the output file itself if inside the root
-    if (outputFilePath.startsWith(rootPath)) {
-      const rel = relative(rootPath, outputFilePath).split(sep).join('/');
+    // 3) Exclude the output file itself if it's inside the rootPath
+    if (outputFilePath.startsWith(rootPath + sep) && outputFilePath !== rootPath) {
+      const relOutputPath = relative(rootPath, outputFilePath).split(sep).join('/');
+      // Add a specific, anchored rule to ignore the output file
       ignoreRules.push({
-        segments: splitIntoSegments(rel),
+        segments: splitIntoSegments(relOutputPath),
         negated: false,
         directoryOnly: false,
-        anchored: false,
+        anchored: true, // Anchor it relative to the root
       });
+       if (!args.quiet && !args.ultraQuiet) {
+           console.log(FORMAT.gray(`(Auto-excluding output file: ${relOutputPath})`));
+       }
     }
 
+    // 4) Set up processing options
     const options = {
       ignoreRules,
       includeRules,
       maxFileSize:  args.maxSize,
       maxTotalSize: args.maxTotalSize,
       maxDepth:     args.maxDepth,
-      rootPath,
+      rootPath, // Pass resolved rootPath
       quiet:        args.quiet,
       ultraQuiet:   args.ultraQuiet,
+      currentDepth: 0 // Start at depth 0
     };
 
-    const statsObj = createStats();
-    const files    = processDirectory(args.path, options, statsObj);
+    // 5) Process directory and collect file info and stats
+    const statsObj = createStats(); // Initialize stats object
+    const files    = processDirectory(rootPath, options, statsObj); // Start processing
 
-    // Build file content digest
-    const digestContent = files.map((file) => {
-      const sepLine = '='.repeat(48) + '\n';
-      return `${sepLine}File: ${file.path}\n${sepLine}${file.content}\n`;
-    }).join('');
-
-    // Build directory tree
+    // 6) Generate Directory Tree String
+    const treeResult = { content: '', truncated: false, count: 0 };
     const directoryTree = generateDirectoryTree(
-      args.path,
+      rootPath, // Start tree from root
       ignoreRules,
       includeRules,
-      args.maxDepth,
-      0,
-      '',
-      rootPath,
-      { content: '', truncated: false },
-      args.ultraQuiet
+      args.maxDepth, // Use same max depth for tree
+      0, '', rootPath, // Initial depth, prefix, root
+      treeResult, // Pass result object
+      args.ultraQuiet,
+      options // Pass options
     );
 
+    // 7) Build File Content Digest String (NO CHECKSUM LINE)
+    const digestContent = files
+      .sort((a, b) => a.path.localeCompare(b.path)) // Sort files by path for consistent output
+      .map((file) => {
+        // Removed checksum calculation during generation
+        // Ensure content ends with a newline for cleaner separation, unless it's empty
+        const contentWithNewline = file.content.length > 0 && !file.content.endsWith('\n')
+            ? file.content + '\n'
+            : file.content;
+        // Output format without the checksum line
+        return `### CODEDIGEST_FILE: ${file.path} ###\n${contentWithNewline}### CODEDIGEST_END ###\n\n`;
+      }).join('');
+
+    // 8) Generate Final Summary String
     const summary = generateSummary(args.path, statsObj, options, args.outputFile);
 
-    ensureDirectoryExists(dirname(outputFilePath));
+    // 9) Write Output File
+    ensureDirectoryExists(outputFilePath); // Make sure output directory exists
     writeFileSync(
       outputFilePath,
-      `Directory Structure\n==================\n${directoryTree}\n\n` +
-      `File Contents\n=============\n${digestContent}\n\n${summary}`
+      `Code Digest for Directory: ${resolve(args.path)}\n` +
+      `Generated: ${new Date().toISOString()}\n\n` +
+      `Directory Structure (${statsObj.fileCount} included files shown)\n`+
+      `==================================================\n`+
+      `${directoryTree}\n\n` +
+      `Included File Contents (${formatBytes(statsObj.totalSize)})\n`+
+      `==================================================\n\n`+
+      `${digestContent}`
+      // Summary is printed to console, not usually included in the digest itself
     );
 
+    // 10) Print summary to console (if not ultra quiet)
     if (!args.ultraQuiet) {
-      console.log(summary);
+      console.log('-----------------------------');
+      console.log(summary); // Print the generated summary
+       console.log(FORMAT.bold(`${FORMAT.green('Digest generation complete.')} Output written to ${FORMAT.gray(outputFilePath)}`));
     }
 
     if (statsObj.errors.length > 0 && !args.ultraQuiet) {
       console.warn(
-        `\nWarning: ${statsObj.errors.length} errors occurred during processing. Check console for details.`
+        FORMAT.yellow(`\nWarning: ${statsObj.errors.length} errors occurred during processing. See summary or console output for details.`)
       );
     }
+
   } catch (error) {
-    console.error(`Fatal error: ${error.message}`);
-    process.exit(1);
+    // Catch errors from parsing, validation, file loading, or core processing
+    console.error(FORMAT.red(`\nFatal Error: ${error.message}`));
+    // Optionally print stack trace for debugging
+    // console.error(error.stack);
+    process.exit(1); // Exit with error code
   }
 }
 
+// Execute main function and catch any unhandled promise rejections
 main().catch((error) => {
-  console.error('Unhandled error:', error);
+  console.error(FORMAT.red('\nUnhandled Error:'), error);
   process.exit(1);
 });
