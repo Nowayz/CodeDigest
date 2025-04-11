@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Nowayz/CodeDigest/refs/heads/resources/codedigest_logo.png" alt="logo"/>
+  <img src="https://raw.githubusercontent.com/Nowayz/CodeDigest/refs/heads/resources/codedigest_logo.svg" alt="logo"/>
 </p>
 CodeDigest is a lean Node.js command-line tool that supports exporting and importing source-code digests (all text-files combined as one). Exporting allows uploading to an LLM, and importing allows an LLM to suggest changes that can be directly imported by the tool.
 
