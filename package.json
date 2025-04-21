@@ -3,7 +3,7 @@
   "bin": {
     "codedigest": "./codedigest.mjs"
   },
-  "version": "2.0.1",
+  "version": "2.0.5",
   "description": "CodeDigest is a simple single-file Node.js command-line tool that consolidates an entire code repository (directory structure and text-based files) into a digest file for easy consumption by your preferred LLM (Large Language Model).",
   "main": "codedigest.mjs",
   "repository": "github:Nowayz/CodeDigest",
