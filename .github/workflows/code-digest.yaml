@@ -1,0 +1,28 @@
+name: Generate Code Digest
+
+on:
+  push:
+    branches:
+      - main # Adjust the branch(es) as needed
+
+jobs:
+  generate-digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18" # Using a recent LTS version
+
+      - name: Generate Code Digest
+        run: npx codedigest --output digest.txt
+
+      - name: Upload Digest as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-digest
+          path: digest.txt
